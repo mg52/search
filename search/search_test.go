@@ -14,7 +14,7 @@ var testProductsJSON []byte
 func TestInsertAndSearch(t *testing.T) {
 	tr := NewTrie()
 	// insert some keys
-	keys := []string{"app", "apple", "banana"}
+	keys := []string{"app", "apple", "banana", "apple"}
 	for _, k := range keys {
 		tr.Insert(k)
 	}
@@ -377,7 +377,7 @@ func TestUpdateDocument(t *testing.T) {
 
 	// Search before updating
 	filter = make(map[string][]interface{})
-	istanbulResult := sec.Search("istanbul", 0, filter)
+	istanbulResult := sec.Search("istanb", 0, filter)
 
 	updatedData := map[string]interface{}{
 		"id":          "2",
