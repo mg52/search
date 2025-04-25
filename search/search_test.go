@@ -265,7 +265,7 @@ func TestRemoveDocumentByID(t *testing.T) {
 
 	weights := map[string]int{"name": 2, "description": 1, "tags": 1}
 	filters := map[string]bool{"year": true}
-	sec := NewSearchEngineController(weights, filters, 10, 1)
+	sec := NewSearchEngineController(weights, filters, 10, 4)
 	sec.Index(docs)
 
 	filter := make(map[string][]interface{})
@@ -339,7 +339,7 @@ func TestUpdateDocument(t *testing.T) {
 
 	weights := map[string]int{"name": 2, "description": 1, "tags": 1}
 	filters := map[string]bool{"year": true}
-	sec := NewSearchEngineController(weights, filters, 10, 1)
+	sec := NewSearchEngineController(weights, filters, 10, 5)
 	sec.Index(docs)
 
 	filter := make(map[string][]interface{})
@@ -386,7 +386,8 @@ func TestUpdateDocument(t *testing.T) {
 		"tags":        []string{"best-seller", "sleek"},
 		"year":        2012,
 	}
-	sec.UpdateDocument(updatedData)
+
+	sec.AddOrUpdateDocument(updatedData)
 
 	// Search after removing
 	filter["year"] = append(filter["year"], 2012)
@@ -436,9 +437,54 @@ func TestUpdateDocument(t *testing.T) {
 
 	// because no document changed related to istanbul term.
 	// before and after update, results should be same
+
+	sort.Slice(istanbulResultNew, func(i, j int) bool {
+		return istanbulResultNew[i].ID > istanbulResultNew[j].ID
+	})
+	sort.Slice(istanbulResult, func(i, j int) bool {
+		return istanbulResult[i].ID > istanbulResult[j].ID
+	})
 	if !reflect.DeepEqual(istanbulResultNew,
 		istanbulResult) {
 		t.Errorf("ScoreIndex mismatch:\n got %#v\n want %#v", istanbulResultNew, istanbulResult)
+	}
+}
+
+func TestUpdateDocument_AddSameTerm(t *testing.T) {
+	var docs []map[string]interface{}
+	if err := json.Unmarshal(testProductsJSON, &docs); err != nil {
+		t.Fatalf("Failed to unmarshal test JSON: %v", err)
+	}
+
+	weights := map[string]int{"name": 2, "description": 1, "tags": 1}
+	filters := map[string]bool{"year": true}
+	sec := NewSearchEngineController(weights, filters, 10, 5)
+	sec.Index(docs)
+
+	filter := make(map[string][]interface{})
+
+	// Search before updating
+	filter = make(map[string][]interface{})
+	result := sec.Search("berron", 0, filter)
+
+	if len(result) != 1 {
+		t.Errorf("Expected search result is 1, got %d", len(result))
+	}
+
+	updatedData := map[string]interface{}{
+		"id":          "7",
+		"name":        "ter updateddenaku berron",
+		"description": "trend precision sleek sleek robust bright superior powerful precision ultimate",
+		"tags":        []string{"best-seller", "sleek"},
+		"year":        2012,
+	}
+
+	sec.AddOrUpdateDocument(updatedData)
+
+	result = sec.Search("berron", 0, filter)
+
+	if len(result) != 1 {
+		t.Errorf("Expected search result is 1, got %d", len(result))
 	}
 }
 

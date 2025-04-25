@@ -15,6 +15,14 @@ import (
 	"github.com/mg52/search/search"
 )
 
+/*
+TODO:
+1. http endpoint for creating index, feeding the index etc.
+2. add save to disk and read from disk feature
+3. add a function that it saves the maps into the disk (hard commit). it will run periodically for example.
+4. (MAYBE) not important term can be removed. only important fields can be handled.
+*/
+
 type HTTP struct {
 	server *http.Server
 	sec    *search.SearchEngineController
@@ -105,8 +113,9 @@ func (ht *HTTP) Query(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	filePath := flag.String("file", "products10m.json", "Path to the JSON file")
-	seWorkers := flag.Int("workers", 1, "Number of search engines that run parallel")
+	filePath := flag.String("file", "~/Documents/GoProjects/search-backup/backups/products10m.json", "Path to the JSON file")
+	// filePath := flag.String("file", "~/Documents/GoProjects/search/search/products.json", "Path to the JSON file")
+	seWorkers := flag.Int("workers", 8, "Number of search engines that run parallel")
 
 	flag.Parse()
 	workersValue := *seWorkers
@@ -139,9 +148,8 @@ func main() {
 
 	// Define field weights
 	weights := map[string]int{
-		"name":        2,
-		"description": 1,
-		"tags":        1,
+		"name": 2,
+		"tags": 2,
 	}
 
 	// Define field filters
@@ -153,6 +161,21 @@ func main() {
 
 	sec := search.NewSearchEngineController(weights, filters, 10, workersValue)
 	sec.Index(products)
+
+	///
+	// // Define field weights
+	// weights = map[string]int{
+	// 	"tags": 2,
+	// }
+
+	// // Define field filters
+	// filters = map[string]bool{
+	// 	"year": true,
+	// }
+
+	// sec2 := search.NewSearchEngineController(weights, filters, 10, workersValue)
+	// sec2.Index(products)
+	///
 
 	// keys, trie := search.GenerateGlobalKeysAndTrie(products, weights)
 	// var seList []*search.SearchEngine
