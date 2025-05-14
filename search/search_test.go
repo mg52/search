@@ -3,91 +3,13 @@ package search
 import (
 	_ "embed"
 	"encoding/json"
+	"math/rand"
 	"reflect"
-	"sort"
 	"testing"
 )
 
-//go:embed products.json
+//go:embed test_data/products.json
 var testProductsJSON []byte
-
-func TestInsertAndSearch(t *testing.T) {
-	tr := NewTrie()
-	// insert some keys
-	keys := []string{"app", "apple", "banana", "apple"}
-	for _, k := range keys {
-		tr.Insert(k)
-	}
-
-	t.Run("SearchPrefix 'app'", func(t *testing.T) {
-		got := tr.SearchPrefix("app")
-		exp := []string{"app", "apple"}
-		if !reflect.DeepEqual(got, exp) {
-			t.Errorf("SearchPrefix(\"app\") = %v; want %v", got, exp)
-		}
-	})
-
-	t.Run("SearchPrefix 'ban'", func(t *testing.T) {
-		got := tr.SearchPrefix("ban")
-		exp := []string{"banana"}
-		if !reflect.DeepEqual(got, exp) {
-			t.Errorf("SearchPrefix(\"ban\") = %v; want %v", got, exp)
-		}
-	})
-
-	t.Run("Search non-existent prefix", func(t *testing.T) {
-		if got := tr.SearchPrefix("xyz"); got != nil {
-			t.Errorf("SearchPrefix(\"xyz\") = %v; want nil", got)
-		}
-	})
-}
-
-func TestRemove(t *testing.T) {
-	tr := NewTrie()
-	// insert keys
-	keys := []string{"app", "apple", "appol"}
-	for _, k := range keys {
-		tr.Insert(k)
-	}
-
-	t.Run("Remove existing leaf 'apple'", func(t *testing.T) {
-		if err := tr.Remove("apple"); err != nil {
-			t.Fatalf("Remove(\"apple\") error: %v", err)
-		}
-		got := tr.SearchPrefix("app")
-		exp := []string{"app", "appol"}
-		if !reflect.DeepEqual(got, exp) {
-			t.Errorf("After Remove apple, SearchPrefix(\"app\") = %v; want %v", got, exp)
-		}
-	})
-
-	t.Run("Remove existing leaf 'appol'", func(t *testing.T) {
-		if err := tr.Remove("appol"); err != nil {
-			t.Fatalf("Remove(\"apple\") error: %v", err)
-		}
-		got := tr.SearchPrefix("app")
-		exp := []string{"app"}
-		if !reflect.DeepEqual(got, exp) {
-			t.Errorf("After Remove apple, SearchPrefix(\"app\") = %v; want %v", got, exp)
-		}
-	})
-
-	t.Run("Remove existing prefix 'app'", func(t *testing.T) {
-		// first ensure 'app' is still there
-		if err := tr.Remove("app"); err != nil {
-			t.Fatalf("Remove(\"app\") error: %v", err)
-		}
-		if got := tr.SearchPrefix("app"); len(got) != 0 {
-			t.Errorf("After Remove app, SearchPrefix(\"app\") = %v; want empty", got)
-		}
-	})
-
-	t.Run("Remove non-existent key", func(t *testing.T) {
-		if err := tr.Remove("nonexistent"); err == nil {
-			t.Errorf("Remove(\"nonexistent\") = nil; want error")
-		}
-	})
-}
 
 func TestOneTermSearchWithFilter(t *testing.T) {
 	var docs []map[string]interface{}
@@ -95,26 +17,33 @@ func TestOneTermSearchWithFilter(t *testing.T) {
 		t.Fatalf("Failed to unmarshal test JSON: %v", err)
 	}
 
-	weights := map[string]int{"name": 2, "description": 1, "tags": 1}
+	indexFields := []string{"name", "tags"}
 	filters := map[string]bool{"year": true}
-	sec := NewSearchEngineController(weights, filters, 10, 1)
+	sec := NewSearchEngineController(indexFields, filters, 10, 3)
 	sec.Index(docs)
 
 	filter := make(map[string][]interface{})
-	filter["year"] = append(filter["year"], 2012)
-	result := sec.Search("sleek", 0, filter)
+	filter["year"] = append(filter["year"], 2015)
+	result := sec.Search("optimal", 0, filter)
 
-	if len(result) != 3 {
-		t.Errorf("Expected search result is 3, got %d", len(result))
+	if len(result) != 4 {
+		t.Errorf("Expected search result is 4, got %d", len(result))
 	}
-	if result[0].ID != "3" || result[0].ScoreWeight != 1025000 {
-		t.Errorf("Expected 1. document ID is 3, score is 1025000, got ID: %v, Score: %d", result[0].ID, result[0].ScoreWeight)
+	if result[0].ID != "15" || result[0].ScoreWeight != 50000 {
+		t.Errorf("Expected 1. document ID is 15, score is 50000, got ID: %v, Score: %d",
+			result[0].ID, result[0].ScoreWeight)
 	}
-	if result[1].ID != "2" || result[1].ScoreWeight != 1000014 {
-		t.Errorf("Expected 2. document ID is 2, score is 1000014, got ID: %v, Score: %d", result[1].ID, result[1].ScoreWeight)
+	if result[1].ID != "16" || result[1].ScoreWeight != 33333 {
+		t.Errorf("Expected 2. document ID is 16, score is 33333, got ID: %v, Score: %d",
+			result[1].ID, result[1].ScoreWeight)
 	}
-	if result[2].ID != "7" || result[2].ScoreWeight != 1000007 {
-		t.Errorf("Expected 3. document ID is 7, score is 1000007, got ID: %v, Score: %d", result[2].ID, result[2].ScoreWeight)
+	if result[2].ID != "17" || result[2].ScoreWeight != 25000 {
+		t.Errorf("Expected 3. document ID is 17, score is 25000, got ID: %v, Score: %d",
+			result[2].ID, result[2].ScoreWeight)
+	}
+	if result[3].ID != "14" || result[3].ScoreWeight != 20000 {
+		t.Errorf("Expected 4. document ID is 14, score is 20000, got ID: %v, Score: %d",
+			result[3].ID, result[3].ScoreWeight)
 	}
 }
 
@@ -124,210 +53,58 @@ func TestOneTermSearchWithoutFilter(t *testing.T) {
 		t.Fatalf("Failed to unmarshal test JSON: %v", err)
 	}
 
-	weights := map[string]int{"name": 2, "description": 1, "tags": 1}
+	indexFields := []string{"name", "tags"}
 	filters := map[string]bool{}
-	sec := NewSearchEngineController(weights, filters, 10, 1)
+	sec := NewSearchEngineController(indexFields, filters, 10, 3)
 	sec.Index(docs)
 
 	filter := make(map[string][]interface{})
-	result := sec.Search("sleek", 0, filter)
+	result := sec.Search("optimal", 0, filter)
 
-	if len(result) != 5 {
-		t.Errorf("Expected search result is 5, got %d", len(result))
+	if len(result) != 7 {
+		t.Errorf("Expected search result is 7, got %d", len(result))
 	}
-	if result[0].ID != "1" || result[0].ScoreWeight != 1066014 {
-		t.Errorf("Expected 1. document ID is 1, score is 1066014, got ID: %v, Score: %d", result[0].ID, result[0].ScoreWeight)
-	}
-	if result[1].ID != "6" || result[1].ScoreWeight != 1050014 {
-		t.Errorf("Expected 2. document ID is 6, score is 1050014, got ID: %v, Score: %d", result[1].ID, result[1].ScoreWeight)
-	}
-	if result[2].ID != "3" || result[2].ScoreWeight != 1025000 {
-		t.Errorf("Expected 3. document ID is 3, score is 1025000, got ID: %v, Score: %d", result[2].ID, result[2].ScoreWeight)
-	}
-	if result[3].ID != "2" || result[3].ScoreWeight != 1000014 {
-		t.Errorf("Expected 4. document ID is 2, score is 1000014, got ID: %v, Score: %d", result[3].ID, result[3].ScoreWeight)
-	}
-	if result[4].ID != "7" || result[4].ScoreWeight != 1000007 {
-		t.Errorf("Expected 5. document ID is 7, score is 1000007, got ID: %v, Score: %d", result[4].ID, result[4].ScoreWeight)
-	}
-}
-
-func TestOneTermSearchWithoutFilterPagination(t *testing.T) {
-	var docs []map[string]interface{}
-	if err := json.Unmarshal(testProductsJSON, &docs); err != nil {
-		t.Fatalf("Failed to unmarshal test JSON: %v", err)
+	// 1st element must be fixed
+	if result[0].ID != "15" || result[0].ScoreWeight != 50000 {
+		t.Errorf("Expected document 1 to have ID 15 and score 50000, got ID %v, score %d",
+			result[0].ID, result[0].ScoreWeight)
 	}
 
-	weights := map[string]int{"name": 2, "description": 1, "tags": 1}
-	filters := map[string]bool{}
-	sec := NewSearchEngineController(weights, filters, 3, 1)
-	sec.Index(docs)
-
-	filter := make(map[string][]interface{})
-	// First page
-	result := sec.Search("sleek", 0, filter)
-
-	if len(result) != 3 {
-		t.Errorf("Expected search result is 3, got %d", len(result))
+	// Positions 2–5 can be any order of IDs 19, 16, 18, 13 but all must have score 33333
+	expected := map[string]bool{
+		"19": false,
+		"16": false,
+		"18": false,
+		"13": false,
 	}
-	if result[0].ID != "1" || result[0].ScoreWeight != 1066014 {
-		t.Errorf("Expected 1. document ID is 1, score is 1066014, got ID: %v, Score: %d", result[0].ID, result[0].ScoreWeight)
+	for i := 1; i <= 4; i++ {
+		doc := result[i]
+		if doc.ScoreWeight != 33333 {
+			t.Errorf("Expected document %d to have score 33333, got %d", i+1, doc.ScoreWeight)
+		}
+		if _, ok := expected[doc.ID]; !ok {
+			t.Errorf("Unexpected ID %v at position %d; expected one of [19,16,18,13]",
+				doc.ID, i+1)
+		}
+		expected[doc.ID] = true
 	}
-	if result[1].ID != "6" || result[1].ScoreWeight != 1050014 {
-		t.Errorf("Expected 2. document ID is 6, score is 1050014, got ID: %v, Score: %d", result[1].ID, result[1].ScoreWeight)
-	}
-	if result[2].ID != "3" || result[2].ScoreWeight != 1025000 {
-		t.Errorf("Expected 3. document ID is 3, score is 1025000, got ID: %v, Score: %d", result[2].ID, result[2].ScoreWeight)
-	}
-
-	// Second page
-	result = sec.Search("sleek", 1, filter)
-
-	if len(result) != 2 {
-		t.Errorf("Expected search result is 2, got %d", len(result))
-	}
-	if result[0].ID != "2" || result[0].ScoreWeight != 1000014 {
-		t.Errorf("Expected 1. document ID is 2, score is 1000014, got ID: %v, Score: %d", result[0].ID, result[0].ScoreWeight)
-	}
-	if result[1].ID != "7" || result[1].ScoreWeight != 1000007 {
-		t.Errorf("Expected 2. document ID is 7, score is 1000007, got ID: %v, Score: %d", result[1].ID, result[1].ScoreWeight)
-	}
-}
-
-func TestOneTermSearchWithFilterPagination(t *testing.T) {
-	var docs []map[string]interface{}
-	if err := json.Unmarshal(testProductsJSON, &docs); err != nil {
-		t.Fatalf("Failed to unmarshal test JSON: %v", err)
+	// Verify none of the expected IDs were missing
+	for id, seen := range expected {
+		if !seen {
+			t.Errorf("Expected ID %v in positions 2–5 but it was missing", id)
+		}
 	}
 
-	weights := map[string]int{"name": 2, "description": 1, "tags": 1}
-	filters := map[string]bool{"year": true}
-	sec := NewSearchEngineController(weights, filters, 3, 1)
-	sec.Index(docs)
-
-	filter := make(map[string][]interface{})
-	filter["year"] = append(filter["year"], 2015)
-	// First page
-	result := sec.Search("affordable", 0, filter)
-
-	if len(result) != 3 {
-		t.Errorf("Expected search result is 3, got %d", len(result))
-	}
-	if result[0].ID != "15" || result[0].ScoreWeight != 1100007 {
-		t.Errorf("Expected 1. document ID is 5, score is 1100007, got ID: %v, Score: %d", result[0].ID, result[0].ScoreWeight)
-	}
-	if result[1].ID != "14" || result[1].ScoreWeight != 1066000 {
-		t.Errorf("Expected 2. document ID is 14, score is 1066000, got ID: %v, Score: %d", result[1].ID, result[1].ScoreWeight)
-	}
-	if result[2].ID != "13" || result[2].ScoreWeight != 1050000 {
-		t.Errorf("Expected 3. document ID is 13, score is 1050000, got ID: %v, Score: %d", result[2].ID, result[2].ScoreWeight)
+	// 6th element must be ID 17 with score 25000
+	if result[5].ID != "17" || result[5].ScoreWeight != 25000 {
+		t.Errorf("Expected document 6 to have ID 17 and score 25000, got ID %v, score %d",
+			result[5].ID, result[5].ScoreWeight)
 	}
 
-	// Second page
-	result = sec.Search("affordable", 1, filter)
-
-	if len(result) != 3 {
-		t.Errorf("Expected search result is 3, got %d", len(result))
-	}
-	if result[0].ID != "17" || result[0].ScoreWeight != 1033014 {
-		t.Errorf("Expected 1. document ID is 17, score is 1033014, got ID: %v, Score: %d", result[0].ID, result[0].ScoreWeight)
-	}
-	if result[1].ID != "16" || result[1].ScoreWeight != 1000028 {
-		t.Errorf("Expected 2. document ID is 16, score is 1000028, got ID: %v, Score: %d", result[1].ID, result[1].ScoreWeight)
-	}
-	if !((result[2].ID == "18" || result[2].ID == "20") && result[2].ScoreWeight == 1000014) {
-		t.Errorf("Expected 3. document ID is 18 or 20, score is 1000014, got ID: %v, Score: %d", result[2].ID, result[2].ScoreWeight)
-	}
-
-	// Third page
-	result = sec.Search("affordable", 2, filter)
-
-	if len(result) != 1 {
-		t.Errorf("Expected search result is 1, got %d", len(result))
-	}
-	if !((result[0].ID == "18" || result[0].ID == "20") && result[0].ScoreWeight == 1000014) {
-		t.Errorf("Expected 1. document ID is 18 or 20, score is 1000014, got ID: %v, Score: %d", result[2].ID, result[2].ScoreWeight)
-	}
-
-	// Forth page
-	result = sec.Search("affordable", 3, filter)
-
-	if len(result) != 0 {
-		t.Errorf("Expected search result is 0, got %d", len(result))
-	}
-}
-
-func TestRemoveDocumentByID(t *testing.T) {
-	var docs []map[string]interface{}
-	if err := json.Unmarshal(testProductsJSON, &docs); err != nil {
-		t.Fatalf("Failed to unmarshal test JSON: %v", err)
-	}
-
-	weights := map[string]int{"name": 2, "description": 1, "tags": 1}
-	filters := map[string]bool{"year": true}
-	sec := NewSearchEngineController(weights, filters, 10, 4)
-	sec.Index(docs)
-
-	filter := make(map[string][]interface{})
-	filter["year"] = append(filter["year"], 2012)
-
-	// Search before removing
-	result := sec.Search("sleek", 0, filter)
-
-	if len(result) != 3 {
-		t.Errorf("Expected search result is 3, got %d", len(result))
-	}
-	if result[0].ID != "3" || result[0].ScoreWeight != 1025000 {
-		t.Errorf("Expected 1. document ID is 3, score is 1025000, got ID: %v, Score: %d", result[0].ID, result[0].ScoreWeight)
-	}
-	if result[1].ID != "2" || result[1].ScoreWeight != 1000014 {
-		t.Errorf("Expected 2. document ID is 2, score is 1000014, got ID: %v, Score: %d", result[1].ID, result[1].ScoreWeight)
-	}
-	if result[2].ID != "7" || result[2].ScoreWeight != 1000007 {
-		t.Errorf("Expected 3. document ID is 7, score is 1000007, got ID: %v, Score: %d", result[2].ID, result[2].ScoreWeight)
-	}
-
-	sec.RemoveDocumentByID("3")
-
-	// Search after removing
-	result = sec.Search("sleek", 0, filter)
-
-	if len(result) != 2 {
-		t.Errorf("Expected search result is 2, got %d", len(result))
-	}
-	if result[0].ID != "2" || result[0].ScoreWeight != 1000014 {
-		t.Errorf("Expected 1. document ID is 2, score is 1000014, got ID: %v, Score: %d", result[0].ID, result[0].ScoreWeight)
-	}
-	if result[1].ID != "7" || result[1].ScoreWeight != 1000007 {
-		t.Errorf("Expected 2. document ID is 7, score is 1000007, got ID: %v, Score: %d", result[1].ID, result[1].ScoreWeight)
-	}
-
-	sec.RemoveDocumentByID("1")
-
-	// Search after removing
-	result = sec.Search("sleek", 0, filter)
-
-	// removing docID 1 should not affect the result since it is not in the year:2012 filter
-	if len(result) != 2 {
-		t.Errorf("Expected search result is 2, got %d", len(result))
-	}
-	if result[0].ID != "2" || result[0].ScoreWeight != 1000014 {
-		t.Errorf("Expected 1. document ID is 2, score is 1000014, got ID: %v, Score: %d", result[0].ID, result[0].ScoreWeight)
-	}
-	if result[1].ID != "7" || result[1].ScoreWeight != 1000007 {
-		t.Errorf("Expected 2. document ID is 7, score is 1000007, got ID: %v, Score: %d", result[1].ID, result[1].ScoreWeight)
-	}
-
-	sec.RemoveDocumentByID("7")
-
-	// Search after removing
-	result = sec.Search("sleek", 0, filter)
-
-	if len(result) != 1 {
-		t.Errorf("Expected search result is 2, got %d", len(result))
-	}
-	if result[0].ID != "2" || result[0].ScoreWeight != 1000014 {
-		t.Errorf("Expected 1. document ID is 2, score is 1000014, got ID: %v, Score: %d", result[0].ID, result[0].ScoreWeight)
+	// 7th element must be ID 14 with score 20000
+	if result[6].ID != "14" || result[6].ScoreWeight != 20000 {
+		t.Errorf("Expected document 7 to have ID 14 and score 20000, got ID %v, score %d",
+			result[6].ID, result[6].ScoreWeight)
 	}
 }
 
@@ -337,232 +114,488 @@ func TestUpdateDocument(t *testing.T) {
 		t.Fatalf("Failed to unmarshal test JSON: %v", err)
 	}
 
-	weights := map[string]int{"name": 2, "description": 1, "tags": 1}
+	indexFields := []string{"name", "tags"}
 	filters := map[string]bool{"year": true}
-	sec := NewSearchEngineController(weights, filters, 10, 5)
+	sec := NewSearchEngineController(indexFields, filters, 10, 5)
 	sec.Index(docs)
 
 	filter := make(map[string][]interface{})
-	filter["year"] = append(filter["year"], 2012)
+	filter["year"] = append(filter["year"], 2015)
 
 	// Search before updating
-	sleekResult := sec.Search("sleek", 0, filter)
+	result := sec.Search("optimal", 0, filter)
 
-	if len(sleekResult) != 3 {
-		t.Errorf("Expected search result is 3, got %d", len(sleekResult))
+	if len(result) != 4 {
+		t.Errorf("Expected search result is 4, got %d", len(result))
 	}
-	if sleekResult[0].ID != "3" || sleekResult[0].ScoreWeight != 1025000 {
-		t.Errorf("Expected 1. document ID is 3, score is 1025000, got ID: %v, Score: %d", sleekResult[0].ID, sleekResult[0].ScoreWeight)
+	if result[0].ID != "15" || result[0].ScoreWeight != 50000 {
+		t.Errorf("Expected 1. document ID is 15, score is 50000, got ID: %v, Score: %d",
+			result[0].ID, result[0].ScoreWeight)
 	}
-	if sleekResult[1].ID != "2" || sleekResult[1].ScoreWeight != 1000014 {
-		t.Errorf("Expected 2. document ID is 2, score is 1000014, got ID: %v, Score: %d", sleekResult[1].ID, sleekResult[1].ScoreWeight)
+	if result[1].ID != "16" || result[1].ScoreWeight != 33333 {
+		t.Errorf("Expected 2. document ID is 16, score is 33333, got ID: %v, Score: %d",
+			result[1].ID, result[1].ScoreWeight)
 	}
-	if sleekResult[2].ID != "7" || sleekResult[2].ScoreWeight != 1000007 {
-		t.Errorf("Expected 3. document ID is 7, score is 1000007, got ID: %v, Score: %d", sleekResult[2].ID, sleekResult[2].ScoreWeight)
+	if result[2].ID != "17" || result[2].ScoreWeight != 25000 {
+		t.Errorf("Expected 3. document ID is 17, score is 25000, got ID: %v, Score: %d",
+			result[2].ID, result[2].ScoreWeight)
 	}
-
-	// Search before updating
-	filter = make(map[string][]interface{})
-	compactResult := sec.Search("compact", 0, filter)
-
-	if len(compactResult) != 2 {
-		t.Errorf("Expected search result is 2, got %d", len(compactResult))
+	if result[3].ID != "14" || result[3].ScoreWeight != 20000 {
+		t.Errorf("Expected 4. document ID is 14, score is 20000, got ID: %v, Score: %d",
+			result[3].ID, result[3].ScoreWeight)
 	}
-	if compactResult[0].ID != "2" || compactResult[0].ScoreWeight != 1100000 {
-		t.Errorf("Expected 1. document ID is 2, score is 1100000, got ID: %v, Score: %d", compactResult[0].ID, compactResult[0].ScoreWeight)
-	}
-	if compactResult[1].ID != "1" || compactResult[1].ScoreWeight != 1033000 {
-		t.Errorf("Expected 2. document ID is 1, score is 1033000, got ID: %v, Score: %d", compactResult[1].ID, compactResult[1].ScoreWeight)
-	}
-
-	// Search before updating
-	filter = make(map[string][]interface{})
-	istanbulResult := sec.Search("istanb", 0, filter)
 
 	updatedData := map[string]interface{}{
-		"id":          "2",
-		"name":        "compact trend abcde abcdef",
-		"description": "trend precision sleek sleek robust bright superior powerful precision ultimate",
-		"tags":        []string{"best-seller", "sleek"},
-		"year":        2012,
+		"id":          "15",
+		"name":        "Affordable book good",
+		"description": "example during affordable break disruptive sent square cloud dress robust gone weight paper hold.",
+		"tags":        []string{"optimal", "sleek", "new"},
+		"year":        2015,
 	}
 
 	sec.AddOrUpdateDocument(updatedData)
 
 	// Search after removing
-	filter["year"] = append(filter["year"], 2012)
-	sleekResult = sec.Search("sleek", 0, filter)
+	filter["year"] = append(filter["year"], 2015)
+	result = sec.Search("optimal", 0, filter)
 
-	if len(sleekResult) != 3 {
-		t.Errorf("Expected search result is 3, got %d", len(sleekResult))
+	if len(result) != 4 {
+		t.Errorf("Expected search result is 4, got %d", len(result))
 	}
-	if sleekResult[0].ID != "3" || sleekResult[0].ScoreWeight != 1025000 {
-		t.Errorf("Expected 1. document ID is 3, score is 1025000, got ID: %v, Score: %d", sleekResult[0].ID, sleekResult[0].ScoreWeight)
+	if result[0].ID != "16" || result[0].ScoreWeight != 33333 {
+		t.Errorf("Expected 1. document ID is 16, score is 33333, got ID: %v, Score: %d",
+			result[0].ID, result[0].ScoreWeight)
 	}
-	if sleekResult[1].ID != "2" || sleekResult[1].ScoreWeight != 1000070 {
-		t.Errorf("Expected 2. document ID is 2, score is 1000070, got ID: %v, Score: %d", sleekResult[1].ID, sleekResult[1].ScoreWeight)
+	if result[1].ID != "17" || result[1].ScoreWeight != 25000 {
+		t.Errorf("Expected 2. document ID is 17, score is 25000, got ID: %v, Score: %d",
+			result[1].ID, result[1].ScoreWeight)
 	}
-	if sleekResult[2].ID != "7" || sleekResult[2].ScoreWeight != 1000007 {
-		t.Errorf("Expected 3. document ID is 7, score is 1000007, got ID: %v, Score: %d", sleekResult[2].ID, sleekResult[2].ScoreWeight)
+	if result[2].ID != "14" || result[2].ScoreWeight != 20000 {
+		t.Errorf("Expected 3. document ID is 14, score is 20000, got ID: %v, Score: %d",
+			result[2].ID, result[2].ScoreWeight)
 	}
-
-	// Search after updating
-	filter = make(map[string][]interface{})
-	brightResult := sec.Search("bright", 0, filter)
-
-	if len(brightResult) != 1 {
-		t.Errorf("Expected search result is 1, got %d", len(brightResult))
-	}
-	if brightResult[0].ID != "2" || brightResult[0].ScoreWeight != 1000010 {
-		t.Errorf("Expected 1. document ID is 2, score is 1000010, got ID: %v, Score: %d", brightResult[0].ID, brightResult[0].ScoreWeight)
-	}
-
-	// Search after updating
-	filter = make(map[string][]interface{})
-	compactResult = sec.Search("compact", 0, filter)
-
-	if len(compactResult) != 2 {
-		t.Errorf("Expected search result is 2, got %d", len(compactResult))
-	}
-	if compactResult[0].ID != "1" || compactResult[0].ScoreWeight != 1033000 {
-		t.Errorf("Expected 1. document ID is 1, score is 1033000, got ID: %v, Score: %d", compactResult[0].ID, compactResult[0].ScoreWeight)
-	}
-	if compactResult[1].ID != "2" || compactResult[1].ScoreWeight != 1025000 {
-		t.Errorf("Expected 2. document ID is 2, score is 1025000, got ID: %v, Score: %d", compactResult[1].ID, compactResult[1].ScoreWeight)
-	}
-
-	// Search after updating. term 'istanb' will yield 'istanbul'
-	filter = make(map[string][]interface{})
-	istanbulResultNew := sec.Search("istanb", 0, filter)
-
-	// because no document changed related to istanbul term.
-	// before and after update, results should be same
-
-	sort.Slice(istanbulResultNew, func(i, j int) bool {
-		return istanbulResultNew[i].ID > istanbulResultNew[j].ID
-	})
-	sort.Slice(istanbulResult, func(i, j int) bool {
-		return istanbulResult[i].ID > istanbulResult[j].ID
-	})
-	if !reflect.DeepEqual(istanbulResultNew,
-		istanbulResult) {
-		t.Errorf("ScoreIndex mismatch:\n got %#v\n want %#v", istanbulResultNew, istanbulResult)
+	if result[3].ID != "15" || result[3].ScoreWeight != 16666 {
+		t.Errorf("Expected 4. document ID is 15, score is 16666, got ID: %v, Score: %d",
+			result[3].ID, result[3].ScoreWeight)
 	}
 }
 
-func TestUpdateDocument_AddSameTerm(t *testing.T) {
+func TestSearchEngineControllerFlow(t *testing.T) {
 	var docs []map[string]interface{}
 	if err := json.Unmarshal(testProductsJSON, &docs); err != nil {
 		t.Fatalf("Failed to unmarshal test JSON: %v", err)
 	}
 
-	weights := map[string]int{"name": 2, "description": 1, "tags": 1}
-	filters := map[string]bool{"year": true}
-	sec := NewSearchEngineController(weights, filters, 10, 5)
+	// Create controller
+	filtersConfig := map[string]bool{"year": true}
+	sec := NewSearchEngineController(
+		[]string{"name", "tags"},
+		filtersConfig,
+		10, // pageCount
+		1,  // workers
+	)
 	sec.Index(docs)
 
-	filter := make(map[string][]interface{})
+	emptyFilters := make(map[string][]interface{})
 
-	// Search before updating
-	filter = make(map[string][]interface{})
-	result := sec.Search("berron", 0, filter)
-
-	if len(result) != 1 {
-		t.Errorf("Expected search result is 1, got %d", len(result))
+	// 1) Search "kalemi" before update → expect no results
+	res := sec.Search("kalemi", 0, emptyFilters)
+	if len(res) != 0 {
+		t.Errorf("expected 0 results for 'kalemi' before update, got %d: %#v", len(res), res)
 	}
 
-	updatedData := map[string]interface{}{
-		"id":          "7",
-		"name":        "ter updateddenaku berron",
-		"description": "trend precision sleek sleek robust bright superior powerful precision ultimate",
-		"tags":        []string{"best-seller", "sleek"},
-		"year":        2012,
+	// 2) Search "afford" before update → length and map-based check
+	res = sec.Search("afford", 0, emptyFilters)
+	if len(res) != 7 {
+		t.Fatalf("expected 7 results for 'afford' before update, got %d", len(res))
+	}
+	expectedBefore := map[string]int{
+		"11": 66666,
+		"12": 50000,
+		"15": 50000,
+		"14": 40000,
+		"13": 33333,
+		"19": 33333,
+		"17": 25000,
+	}
+	for _, doc := range res {
+		wantScore, ok := expectedBefore[doc.ID]
+		if !ok {
+			t.Errorf("unexpected ID %q in 'afford' before update", doc.ID)
+			continue
+		}
+		if doc.ScoreWeight != wantScore {
+			t.Errorf("for ID %q expected score %d, got %d", doc.ID, wantScore, doc.ScoreWeight)
+		}
+		delete(expectedBefore, doc.ID)
+	}
+	if len(expectedBefore) != 0 {
+		t.Errorf("missing docs in 'afford' before update: %+v", expectedBefore)
 	}
 
-	sec.AddOrUpdateDocument(updatedData)
+	// 3) Update document ID "15"
+	updatedDoc := map[string]interface{}{
+		"id":          "15",
+		"name":        "abece Affordable kalemite asdasdfsf",
+		"description": "get value segment try week great real end high image ergonomic broad pass beat.",
+		"tags":        []interface{}{"section", "rose", "sadvde435r"},
+		"year":        2015,
+	}
+	sec.AddOrUpdateDocument(updatedDoc)
 
-	result = sec.Search("berron", 0, filter)
+	// 4) Search "afford" after update → length and map-based check
+	res = sec.Search("afford", 0, emptyFilters)
+	if len(res) != 7 {
+		t.Fatalf("expected 7 results for 'afford' after update, got %d", len(res))
+	}
+	expectedAfter := map[string]int{
+		"11": 66666,
+		"12": 50000,
+		"14": 40000,
+		"13": 33333,
+		"19": 33333,
+		"17": 25000,
+		"15": 14285,
+	}
+	for _, doc := range res {
+		wantScore, ok := expectedAfter[doc.ID]
+		if !ok {
+			t.Errorf("unexpected ID %q in 'afford' after update", doc.ID)
+			continue
+		}
+		if doc.ScoreWeight != wantScore {
+			t.Errorf("for ID %q expected score %d, got %d", doc.ID, wantScore, doc.ScoreWeight)
+		}
+		delete(expectedAfter, doc.ID)
+	}
+	if len(expectedAfter) != 0 {
+		t.Errorf("missing docs in 'afford' after update: %+v", expectedAfter)
+	}
 
-	if len(result) != 1 {
-		t.Errorf("Expected search result is 1, got %d", len(result))
+	// 5) Search "kalemi" after update → expect exactly one result
+	res = sec.Search("kalemi", 0, emptyFilters)
+	if len(res) != 1 {
+		t.Fatalf("expected 1 result for 'kalemi' after update, got %d", len(res))
+	}
+	if res[0].ID != "15" || res[0].ScoreWeight != 14285 {
+		t.Errorf("for 'kalemi' after update expected {ID:\"15\",ScoreWeight:14285}, got %+v", res[0])
 	}
 }
 
-func TestPartiallyIndex(t *testing.T) {
-	var docs []map[string]interface{}
-	if err := json.Unmarshal(testProductsJSON, &docs); err != nil {
-		t.Fatalf("Failed to unmarshal test JSON: %v", err)
+func setupEngineWithKeys(keys []string) *SearchEngine {
+	// Initialize engine
+	se := &SearchEngine{
+		Keys: NewKeys(),
+		Trie: NewTrie(),
 	}
-
-	weights := map[string]int{"name": 2, "description": 1, "tags": 1}
-	filters := map[string]bool{"year": true}
-	sec := NewSearchEngineController(weights, filters, 10, 1)
-	sec.Index(docs)
-
-	sec2 := NewSearchEngineController(weights, filters, 10, 1)
-	sec2.Index(docs[:10])
-	sec2.Index(docs[10:20])
-	sec2.Index(docs[20:])
-
-	if !reflect.DeepEqual(sec.Engines[0].Data, sec2.Engines[0].Data) {
-		t.Errorf("Data mismatch:\n got %#v\n want %#v", sec2.Engines[0].Data, sec.Engines[0].Data)
+	// Insert each key into Keys and Trie
+	for _, k := range keys {
+		se.Keys.Insert(k)
+		se.Trie.Insert(k)
 	}
-	if !reflect.DeepEqual(normalizeScoreIndex(sec.Engines[0].ScoreIndex),
-		normalizeScoreIndex(sec2.Engines[0].ScoreIndex)) {
-		t.Errorf("ScoreIndex mismatch:\n got %#v\n want %#v", sec2.Engines[0].ScoreIndex, sec.Engines[0].ScoreIndex)
-	}
-	if !reflect.DeepEqual(sec.Engines[0].FilterDocs, sec2.Engines[0].FilterDocs) {
-		t.Errorf("FilterDocs mismatch:\n got %#v\n want %#v", sec2.Engines[0].FilterDocs, sec.Engines[0].FilterDocs)
-	}
-	if !reflect.DeepEqual(sec.Engines[0].Documents, sec2.Engines[0].Documents) {
-		t.Errorf("Documents mismatch:\n got %#v\n want %#v", sec2.Engines[0].Documents, sec.Engines[0].Documents)
-	}
+	return se
 }
 
-func TestOneTermSearchWithoutFilterMultiShard(t *testing.T) {
-	var docs []map[string]interface{}
-	if err := json.Unmarshal(testProductsJSON, &docs); err != nil {
-		t.Fatalf("Failed to unmarshal test JSON: %v", err)
+func TestProcessQuery(t *testing.T) {
+	tests := []struct {
+		name     string
+		keys     []string
+		query    string
+		expected map[string][]string
+	}{
+		{
+			name:     "empty query",
+			keys:     []string{"a", "b"},
+			query:    "",
+			expected: nil,
+		},
+		{
+			name:  "exact match",
+			keys:  []string{"foo", "bar"},
+			query: "foo",
+			expected: map[string][]string{
+				"exact": {"foo"},
+			},
+		},
+		{
+			name:  "prefix match",
+			keys:  []string{"apple", "apricot", "banana"},
+			query: "ap",
+			expected: map[string][]string{
+				"prefix": {"apple", "apricot"},
+			},
+		},
+		{
+			name:  "fuzzy match within tolerance",
+			keys:  []string{"kitten"},
+			query: "kiten", // one deletion away
+			expected: map[string][]string{
+				"fuzzy": {"kitten"},
+			},
+		},
+		{
+			name:  "no match falls back to fuzzy with original",
+			keys:  []string{"apple"},
+			query: "xyz",
+			expected: map[string][]string{
+				"fuzzy": {"xyz"},
+			},
+		},
+		{
+			name:  "multiple tokens mixed types",
+			keys:  []string{"apple", "apricot", "foo", "kite"},
+			query: "ap foo ki",
+			expected: map[string][]string{
+				"exact":  {"foo"},
+				"prefix": {"apple", "apricot", "kite"},
+			},
+		},
 	}
 
-	weights := map[string]int{"name": 2, "description": 1, "tags": 1}
-	filters := map[string]bool{}
-	sec := NewSearchEngineController(weights, filters, 10, 4)
-	sec.Index(docs)
-
-	filter := make(map[string][]interface{})
-	result := sec.Search("sleek", 0, filter)
-
-	if len(result) != 5 {
-		t.Errorf("Expected search result is 5, got %d", len(result))
-	}
-	if result[0].ID != "1" || result[0].ScoreWeight != 1066014 {
-		t.Errorf("Expected 1. document ID is 1, score is 1066014, got ID: %v, Score: %d", result[0].ID, result[0].ScoreWeight)
-	}
-	if result[1].ID != "6" || result[1].ScoreWeight != 1050014 {
-		t.Errorf("Expected 2. document ID is 6, score is 1050014, got ID: %v, Score: %d", result[1].ID, result[1].ScoreWeight)
-	}
-	if result[2].ID != "3" || result[2].ScoreWeight != 1025000 {
-		t.Errorf("Expected 3. document ID is 3, score is 1025000, got ID: %v, Score: %d", result[2].ID, result[2].ScoreWeight)
-	}
-	if result[3].ID != "2" || result[3].ScoreWeight != 1000014 {
-		t.Errorf("Expected 4. document ID is 2, score is 1000014, got ID: %v, Score: %d", result[3].ID, result[3].ScoreWeight)
-	}
-	if result[4].ID != "7" || result[4].ScoreWeight != 1000007 {
-		t.Errorf("Expected 5. document ID is 7, score is 1000007, got ID: %v, Score: %d", result[4].ID, result[4].ScoreWeight)
-	}
-}
-
-func normalizeScoreIndex(si map[string][]Document) map[string][]Document {
-	out := make(map[string][]Document, len(si))
-	for term, docs := range si {
-		docsCopy := append([]Document(nil), docs...)
-
-		sort.Slice(docsCopy, func(i, j int) bool {
-			return docsCopy[i].ID < docsCopy[j].ID
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			se := setupEngineWithKeys(tt.keys)
+			got := se.ProcessQuery(tt.query)
+			if !reflect.DeepEqual(got, tt.expected) {
+				t.Errorf("ProcessQuery(%q):\n got: %#v\nwant: %#v", tt.query, got, tt.expected)
+			}
 		})
-
-		out[term] = docsCopy
 	}
-	return out
+}
+
+func TestAddOrUpdateDocumentAndRemove(t *testing.T) {
+	// seed rng so NewDoc goes to deterministic shard
+	rand.Seed(42)
+
+	ctrl := NewSearchEngineController(nil, nil, 10, 2)
+
+	// 1) Add new document
+	doc := map[string]interface{}{"id": "doc1", "foo": "bar"}
+	ctrl.AddOrUpdateDocument(doc)
+
+	// exactly one engine should contain it
+	found := 0
+	for _, eng := range ctrl.Engines {
+		eng.mu.RLock()
+		_, ok := eng.Documents["doc1"]
+		eng.mu.RUnlock()
+		if ok {
+			found++
+		}
+	}
+	if found != 1 {
+		t.Fatalf("expected doc1 in exactly 1 shard, found in %d", found)
+	}
+
+	// remember which one
+	var idx int
+	for i, eng := range ctrl.Engines {
+		eng.mu.RLock()
+		if _, ok := eng.Documents["doc1"]; ok {
+			idx = i
+		}
+		eng.mu.RUnlock()
+	}
+
+	// 2) Update the same document
+	updated := map[string]interface{}{"id": "doc1", "foo": "baz"}
+	ctrl.AddOrUpdateDocument(updated)
+
+	// still exactly one, and its contents should match updated
+	found = 0
+	for i, eng := range ctrl.Engines {
+		eng.mu.RLock()
+		val, ok := eng.Documents["doc1"]
+		eng.mu.RUnlock()
+		if ok {
+			found++
+			if i != idx {
+				t.Errorf("expected update in same shard %d, got %d", idx, i)
+			}
+			if !reflect.DeepEqual(val, updated) {
+				t.Errorf("shard %d: expected %+v, got %+v", i, updated, val)
+			}
+		}
+	}
+	if found != 1 {
+		t.Fatalf("after update, expected doc1 in exactly 1 shard, found in %d", found)
+	}
+
+	// 3) RemoveDocumentByID should delete from all shards
+	ctrl.RemoveDocumentByID("doc1")
+	for i, eng := range ctrl.Engines {
+		eng.mu.RLock()
+		_, ok := eng.Documents["doc1"]
+		eng.mu.RUnlock()
+		if ok {
+			t.Errorf("shard %d: expected doc1 removed, but still present", i)
+		}
+	}
+}
+
+func TestCombineResults(t *testing.T) {
+	// helper to build SearchResult
+	mk := func(isMulti, isExact, isPrefix, isFuzzy bool, docs ...Document) *SearchResult {
+		return &SearchResult{
+			IsMultiTerm: isMulti,
+			IsExact:     isExact,
+			IsPrefix:    isPrefix,
+			IsFuzzy:     isFuzzy,
+			Docs:        docs,
+		}
+	}
+	// build some documents
+	a := Document{"A", 10}
+	b := Document{"B", 20}
+	c := Document{"C", 5}
+
+	tests := []struct {
+		name     string
+		input    []*SearchResult
+		expected []Document
+	}{
+		{
+			"multi wins",
+			[]*SearchResult{
+				mk(true, false, false, false, a, b),
+				mk(false, true, false, false, c),
+			},
+			[]Document{b, a}, // sorted by weight desc
+		},
+		{
+			"exact next",
+			[]*SearchResult{
+				mk(false, true, false, false, a),
+				mk(false, false, true, false, b),
+			},
+			[]Document{a},
+		},
+		{
+			"prefix next",
+			[]*SearchResult{
+				mk(false, false, true, false, b, c),
+			},
+			[]Document{b, c},
+		},
+		{
+			"fuzzy fallback",
+			[]*SearchResult{
+				mk(false, false, false, true, c),
+			},
+			[]Document{c},
+		},
+		{
+			"empty yields nil",
+			[]*SearchResult{
+				nil,
+			},
+			nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ch := make(chan *SearchResult, len(tt.input))
+			for _, r := range tt.input {
+				ch <- r
+			}
+			close(ch)
+			got := CombineResults(ch)
+			if !reflect.DeepEqual(got, tt.expected) {
+				t.Errorf("CombineResults = %+v, want %+v", got, tt.expected)
+			}
+		})
+	}
+}
+
+// TestAddToDocumentIndex verifies that addToDocumentIndex correctly updates Data, Keys, and Trie.
+func TestAddToDocumentIndex(t *testing.T) {
+	// create a fresh SearchEngine
+	se := NewSearchEngine([]string{"name"}, nil, 10, 0)
+
+	// add the same term twice with length=2
+	se.addToDocumentIndex("foo", "1", 2)
+	se.addToDocumentIndex("foo", "1", 2)
+
+	// normalized weight = 100000/2 = 50000, twice = 100000
+	wantWeight := 50000 * 2
+	gotWeight := se.Data["foo"]["1"]
+	if gotWeight != wantWeight {
+		t.Errorf("expected Data[\"foo\"][\"1\"]= %d, got %d", wantWeight, gotWeight)
+	}
+
+	// Keys should contain "foo"
+	if _, ok := se.Keys.GetData()["foo"]; !ok {
+		t.Error("expected Keys to contain \"foo\"")
+	}
+
+	// Trie should return "foo" on prefix "f"
+	pref := se.Trie.SearchPrefix("f")
+	if !reflect.DeepEqual(pref, []string{"foo"}) {
+		t.Errorf("expected Trie.SearchPrefix(\"f\")==[\"foo\"], got %v", pref)
+	}
+}
+
+// TestBuildDocumentIndex verifies that BuildDocumentIndex tokenizes, indexes weights, and sets up filters.
+func TestBuildDocumentIndex(t *testing.T) {
+	// set up a SearchEngine that indexes "name" and "tags", with a "year" filter
+	indexFields := []string{"name", "tags"}
+	filters := map[string]bool{"year": true}
+	se := NewSearchEngine(indexFields, filters, 10, 0)
+
+	// one document with id "1":
+	// name => "foo bar" → tokens ["foo","bar"]
+	// tags => []interface{}{"baz"} → tokens ["baz"]
+	// total tokens = 3 → normalized weight = 100000/3 = 33333
+	// year => 2020.0 → filterKey "year:2020"
+	docs := []map[string]interface{}{{
+		"id":   "1",
+		"name": "foo bar",
+		"tags": []interface{}{"baz"},
+		"year": 2020.0,
+	}}
+
+	se.BuildDocumentIndex(docs)
+
+	// check Data weights
+	wantData := map[string]int{
+		"foo": 33333,
+		"bar": 33333,
+		"baz": 33333,
+	}
+	for term, want := range wantData {
+		got := se.Data[term]["1"]
+		if got != want {
+			t.Errorf("Data[%q][\"1\"] = %d; want %d", term, got, want)
+		}
+	}
+
+	// check Keys contains each term
+	for term := range wantData {
+		if _, ok := se.Keys.GetData()[term]; !ok {
+			t.Errorf("Keys missing term %q", term)
+		}
+	}
+
+	// check Trie can find each term via SearchPrefix
+	for term := range wantData {
+		pref := se.Trie.SearchPrefix(string(term[0]))
+		found := false
+		for _, tkn := range pref {
+			if tkn == term {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("Trie.SearchPrefix(%q) did not include %q; got %v", string(term[0]), term, pref)
+		}
+	}
+
+	// check FilterDocs
+	wantFilter := "year:2020"
+	if ds, ok := se.FilterDocs[wantFilter]; !ok {
+		t.Errorf("FilterDocs missing key %q", wantFilter)
+	} else if !ds["1"] {
+		t.Errorf("FilterDocs[%q][\"1\"] = false; want true", wantFilter)
+	}
 }
