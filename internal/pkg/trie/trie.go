@@ -1,4 +1,4 @@
-package search
+package trie
 
 import (
 	"encoding/gob"

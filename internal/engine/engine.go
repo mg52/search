@@ -1,20 +1,27 @@
-package search
+package engine
 
 import (
 	"encoding/gob"
 	"fmt"
 	"os"
+	"regexp"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/mg52/search/internal/pkg/keys"
+	"github.com/mg52/search/internal/pkg/trie"
 )
 
+// Document represents a search result with an ID and its computed weight.
 type Document struct {
 	ID          string
 	ScoreWeight int
 }
 
+// SearchResult encapsulates the result of a search on one shard.
 type SearchResult struct {
 	Docs        []Document
 	IsMultiTerm bool
@@ -23,47 +30,46 @@ type SearchResult struct {
 	IsFuzzy     bool
 }
 
+// TokenFieldPair associates a token with its originating field (unused).
 type TokenFieldPair struct {
 	Token string
 	Field string
 }
 
-// Predefined list of stopwords
+// stopWords lists common words to exclude from indexing.
 var stopWords = map[string]bool{
 	"is": true, "a": true, "the": true, "and": true, "or": true, "to": true, "in": true, "of": true,
 }
 
-// bundle up just the fields we want to persist
+// enginePayload serializes the core SearchEngine state.
 type enginePayload struct {
-	Data             map[string]map[string]int
-	Documents        map[string]map[string]interface{}
-	ScoreIndex       map[string][]Document
-	FilterDocs       map[string]map[string]bool
-	IndexFields      []string
-	Filters          map[string]bool
-	PageSize         int
-	TotalFieldCounts map[string]int
-	Keys             *Keys
-	Trie             *Trie
+	Data        map[string]map[string]int
+	Documents   map[string]map[string]interface{}
+	ScoreIndex  map[string][]Document
+	FilterDocs  map[string]map[string]bool
+	IndexFields []string
+	Filters     map[string]bool
+	PageSize    int
+	Keys        *keys.Keys
+	Trie        *trie.Trie
 }
 
-// SearchEngine holds documents, the inverted index, and weights configuration.
+// SearchEngine maintains an inverted index, documents, and search structures.
 type SearchEngine struct {
-	ShardID          int
-	Data             map[string]map[string]int         // term -> docID -> int
-	Documents        map[string]map[string]interface{} // docID -> fields
-	ScoreIndex       map[string][]Document             // term -> Documents (ordered by weight desc)
-	FilterDocs       map[string]map[string]bool        // filter -> docID e.g., map["year:2019"]map["doc1"] = true
-	Keys             *Keys
-	Trie             *Trie
-	IndexFields      []string
-	Filters          map[string]bool // filters for fields
-	PageSize         int             // size of the documents in a search response.
-	TotalFieldCounts map[string]int  // cumulative sum of token/counts per field
-	mu               sync.RWMutex
+	ShardID     int
+	Data        map[string]map[string]int         // term -> docID -> int
+	Documents   map[string]map[string]interface{} // docID -> fields
+	ScoreIndex  map[string][]Document             // term -> Documents (ordered by weight desc)
+	FilterDocs  map[string]map[string]bool        // filter -> docID e.g., map["year:2019"]map["doc1"] = true
+	Keys        *keys.Keys
+	Trie        *trie.Trie
+	IndexFields []string
+	Filters     map[string]bool // filters for fields
+	PageSize    int             // size of the documents in a search response.
+	mu          sync.RWMutex
 }
 
-// NewSearchEngine initializes a new search engine with custom weights.
+// NewSearchEngine initializes a new search engine.
 func NewSearchEngine(
 	indexFields []string,
 	filters map[string]bool,
@@ -75,8 +81,8 @@ func NewSearchEngine(
 		IndexFields: indexFields,
 		Filters:     filters,
 		ScoreIndex:  make(map[string][]Document),
-		Keys:        NewKeys(),
-		Trie:        NewTrie(),
+		Keys:        keys.NewKeys(),
+		Trie:        trie.NewTrie(),
 		FilterDocs:  make(map[string]map[string]bool),
 		PageSize:    pageSize,
 	}
@@ -87,33 +93,27 @@ func init() {
 	gob.Register(Document{})
 	gob.Register(map[string]interface{}{})
 	gob.Register([]interface{}{})
-	gob.Register(&Trie{})
-	gob.Register(&TrieNode{})
+	gob.Register(&trie.Trie{})
+	gob.Register(&trie.TrieNode{})
 }
 
-// SaveAll persists the entire SearchEngine under three files:
-//
-//	<prefix>.engine.gob   – enginePayload
-//	<prefix>.keys.gob     – k.Data
-//	<prefix>.trie.gob     – t.Root/children
+// SaveAll writes the engine state to disk as gob files with the given prefix.
+// It serializes the core payload; keys and trie may be saved separately if needed.
 func (se *SearchEngine) SaveAll(path string) error {
-	// 1) save the core engine fields
 	se.mu.RLock()
 	payload := enginePayload{
-		Data:             se.Data,
-		Documents:        se.Documents,
-		ScoreIndex:       se.ScoreIndex,
-		FilterDocs:       se.FilterDocs,
-		IndexFields:      se.IndexFields,
-		Filters:          se.Filters,
-		PageSize:         se.PageSize,
-		TotalFieldCounts: se.TotalFieldCounts,
-		Keys:             se.Keys,
-		Trie:             se.Trie,
+		Data:        se.Data,
+		Documents:   se.Documents,
+		ScoreIndex:  se.ScoreIndex,
+		FilterDocs:  se.FilterDocs,
+		IndexFields: se.IndexFields,
+		Filters:     se.Filters,
+		PageSize:    se.PageSize,
+		Keys:        se.Keys,
+		Trie:        se.Trie,
 	}
 	se.mu.RUnlock()
 
-	// engine state
 	engineFile := path + ".engine.gob"
 	f, err := os.Create(engineFile)
 	if err != nil {
@@ -126,38 +126,24 @@ func (se *SearchEngine) SaveAll(path string) error {
 	}
 	f.Close()
 
-	// // 2) save keys
-	// keysFile := prefix + ".keys.gob"
-	// if err := se.Keys.Save(keysFile); err != nil {
-	// 	return fmt.Errorf("save keys: %w", err)
-	// }
-
-	// // 3) save trie
-	// trieFile := prefix + ".trie.gob"
-	// if err := se.Trie.Save(trieFile); err != nil {
-	// 	return fmt.Errorf("save trie: %w", err)
-	// }
-
 	return nil
 }
 
-// LoadAll restores a SearchEngine from three files with the given prefix.
-// If any file is missing, it initializes that piece fresh and continues.
+// LoadAll loads a SearchEngine from gob files with the given prefix.
+// Missing files are skipped, resulting in fresh defaults for those parts.
 func LoadAll(path string) (*SearchEngine, error) {
 	se := &SearchEngine{
-		Data:             make(map[string]map[string]int),
-		Documents:        make(map[string]map[string]interface{}),
-		ScoreIndex:       make(map[string][]Document),
-		FilterDocs:       make(map[string]map[string]bool),
-		Keys:             NewKeys(),
-		Trie:             NewTrie(),
-		IndexFields:      nil,
-		Filters:          make(map[string]bool),
-		PageSize:         0,
-		TotalFieldCounts: make(map[string]int),
+		Data:        make(map[string]map[string]int),
+		Documents:   make(map[string]map[string]interface{}),
+		ScoreIndex:  make(map[string][]Document),
+		FilterDocs:  make(map[string]map[string]bool),
+		Keys:        keys.NewKeys(),
+		Trie:        trie.NewTrie(),
+		IndexFields: nil,
+		Filters:     make(map[string]bool),
+		PageSize:    0,
 	}
 
-	// 1) engine payload
 	engineFile := path + ".engine.gob"
 	if f, err := os.Open(engineFile); err == nil {
 		var payload enginePayload
@@ -175,7 +161,6 @@ func LoadAll(path string) (*SearchEngine, error) {
 		se.IndexFields = payload.IndexFields
 		se.Filters = payload.Filters
 		se.PageSize = payload.PageSize
-		se.TotalFieldCounts = payload.TotalFieldCounts
 		se.Keys = payload.Keys
 		se.Trie = payload.Trie
 	}
@@ -183,6 +168,7 @@ func LoadAll(path string) (*SearchEngine, error) {
 	return se, nil
 }
 
+// Index wraps BuildDocumentIndex, BuildScoreIndex, and InsertDocs with timing logs.
 func (se *SearchEngine) Index(shardID int, docs []map[string]interface{}) {
 	fmt.Println("BuildDocumentIndex starting...")
 	start := time.Now()
@@ -209,7 +195,7 @@ func (se *SearchEngine) Index(shardID int, docs []map[string]interface{}) {
 // - "prefix": tokens that match prefixes found in the GlobalTrie.
 // - "fuzzy": tokens that approximately match entries in GlobalKeys within a given edit distance.
 func (sec *SearchEngine) ProcessQuery(query string) map[string][]string {
-	queryTokens := tokenize(query)
+	queryTokens := Tokenize(query)
 	if len(queryTokens) == 0 {
 		return nil
 	}
@@ -243,6 +229,7 @@ func (sec *SearchEngine) ProcessQuery(query string) map[string][]string {
 	return result
 }
 
+// BuildScoreIndex constructs the ScoreIndex by sorting each term's postings by weight.
 func (se *SearchEngine) BuildScoreIndex() {
 	workers := runtime.NumCPU()
 	var wg sync.WaitGroup
@@ -276,6 +263,7 @@ func (se *SearchEngine) BuildScoreIndex() {
 	wg.Wait()
 }
 
+// InsertDocs stores raw documents for retrieval without reindexing.
 func (se *SearchEngine) InsertDocs(docs []map[string]interface{}) {
 	for i, doc := range docs {
 		if i%100_000 == 0 || i == len(docs)-1 {
@@ -295,6 +283,7 @@ func (se *SearchEngine) InsertDocs(docs []map[string]interface{}) {
 	}
 }
 
+// BuildDocumentIndex tokenizes each document and updates the inverted index and filters.
 func (se *SearchEngine) BuildDocumentIndex(docs []map[string]interface{}) {
 	for i, doc := range docs {
 		if i%100_000 == 0 || i == len(docs)-1 {
@@ -315,17 +304,17 @@ func (se *SearchEngine) BuildDocumentIndex(docs []map[string]interface{}) {
 			if value, exists := doc[weightField]; exists {
 				switch v := value.(type) {
 				case string:
-					tokens := tokenize(v)
+					tokens := Tokenize(v)
 					allTokens = append(allTokens, tokens...)
 				case []string:
 					for _, item := range v {
-						tokens := tokenize(item)
+						tokens := Tokenize(item)
 						allTokens = append(allTokens, tokens...)
 					}
 				case []interface{}:
 					for _, item := range v {
 						if str, ok := item.(string); ok {
-							tokens := tokenize(str)
+							tokens := Tokenize(str)
 							allTokens = append(allTokens, tokens...)
 						}
 					}
@@ -362,6 +351,7 @@ func (se *SearchEngine) BuildDocumentIndex(docs []map[string]interface{}) {
 	}
 }
 
+// addToDocumentIndex adds weight for term→docID and updates Keys/Trie if needed.
 func (se *SearchEngine) addToDocumentIndex(
 	term, docID string, length int,
 ) {
@@ -381,6 +371,7 @@ func (se *SearchEngine) addToDocumentIndex(
 	se.mu.Unlock()
 }
 
+// SearchOneTermWithoutFilter returns a page of results for a single term.
 func (se *SearchEngine) SearchOneTermWithoutFilter(query string, page int) []Document {
 	se.mu.RLock()
 	defer se.mu.RUnlock()
@@ -396,6 +387,8 @@ func (se *SearchEngine) SearchOneTermWithoutFilter(query string, page int) []Doc
 	return se.ScoreIndex[query][lastIndex:stop]
 }
 
+// ApplyFilter returns the set of docIDs matching the given filter criteria.
+// It supports single or multiple values per filter field.
 func (se *SearchEngine) ApplyFilter(filters map[string][]interface{}) map[string]bool {
 	if len(filters) == 1 {
 		for key, values := range filters {
@@ -429,6 +422,8 @@ func (se *SearchEngine) ApplyFilter(filters map[string][]interface{}) map[string
 	return nil
 }
 
+// SearchOneTermWithFilter retrieves a page of documents matching a term, applying filter constraints.
+// It returns at most PageSize documents from the filtered set.
 func (se *SearchEngine) SearchOneTermWithFilter(query string, filters map[string][]interface{}, page int) []Document {
 	filteredDocs := se.ApplyFilter(filters)
 	lastIndex := page * se.PageSize
@@ -464,6 +459,7 @@ func (se *SearchEngine) SearchOneTermWithFilter(query string, filters map[string
 	return finalDocs[lastIndex:]
 }
 
+// searchAllWithoutFilter handles multi-term searches (exact + optional other terms) without filtering.
 func (se *SearchEngine) searchAllWithoutFilter(exactTerms, otherTerms []string, page int) []Document {
 	se.mu.RLock()
 	defer se.mu.RUnlock()
@@ -533,6 +529,7 @@ func (se *SearchEngine) searchAllWithoutFilter(exactTerms, otherTerms []string, 
 	return finalDocs[startIndex:stopIndex]
 }
 
+// searchAllWithFilter handles multi-term searches with filtering applied.
 func (se *SearchEngine) searchAllWithFilter(exactTerms, otherTerms []string, filteredDocs map[string]bool, page int) []Document {
 	se.mu.RLock()
 	defer se.mu.RUnlock()
@@ -604,17 +601,21 @@ func (se *SearchEngine) searchAllWithFilter(exactTerms, otherTerms []string, fil
 	return finalDocs[startIndex:stopIndex]
 }
 
+// SearchMultipleTermsWithoutFilter is a public wrapper for multi-term searches without filters.
 func (se *SearchEngine) SearchMultipleTermsWithoutFilter(queriesMap map[string][]string, page int) []Document {
 	result := se.searchAllWithoutFilter(queriesMap["exact"], append(queriesMap["prefix"], queriesMap["fuzzy"]...), page)
 	return result
 }
 
+// SearchMultipleTermsWithFilter is a public wrapper for multi-term searches with filters.
 func (se *SearchEngine) SearchMultipleTermsWithFilter(queriesMap map[string][]string, filters map[string][]interface{}, page int) []Document {
 	filteredDocs := se.ApplyFilter(filters)
 	result := se.searchAllWithFilter(queriesMap["exact"], append(queriesMap["prefix"], queriesMap["fuzzy"]...), filteredDocs, page)
 	return result
 }
 
+// Search executes a full query (possibly multi-term) with optional filters,
+// selecting the correct search path (exact, prefix, fuzzy, or multi-term).
 func (se *SearchEngine) Search(query string, page int, filters map[string][]interface{}) *SearchResult {
 	queryTokens := se.ProcessQuery(query)
 	fmt.Println("ProcessQuery:", queryTokens)
@@ -715,6 +716,8 @@ func (se *SearchEngine) Search(query string, page int, filters map[string][]inte
 	}
 }
 
+// addScoreIndex inserts or updates the score entry for a document across multiple tokens,
+// keeping each token’s ScoreIndex slice sorted in descending order by ScoreWeight.
 func (se *SearchEngine) addScoreIndex(tokens []string, docID string) {
 	for _, token := range tokens {
 		se.mu.RLock()
@@ -756,17 +759,17 @@ func (se *SearchEngine) addDocument(doc map[string]interface{}) {
 		if value, exists := doc[weightField]; exists {
 			switch v := value.(type) {
 			case string:
-				tokens := tokenize(v)
+				tokens := Tokenize(v)
 				se.addScoreIndex(tokens, docID)
 			case []string:
 				for _, item := range v {
-					tokens := tokenize(item)
+					tokens := Tokenize(item)
 					se.addScoreIndex(tokens, docID)
 				}
 			case []interface{}:
 				for _, item := range v {
 					if str, ok := item.(string); ok {
-						tokens := tokenize(str)
+						tokens := Tokenize(str)
 						se.addScoreIndex(tokens, docID)
 					}
 				}
@@ -816,4 +819,58 @@ func (se *SearchEngine) removeDocumentByID(docID string) {
 	}
 
 	delete(se.Documents, docID)
+}
+
+// Tokenize splits text into words, removes non-alphanumeric characters, and excludes stopwords.
+func Tokenize(content string) []string {
+	nonAlphaNumeric := regexp.MustCompile(`[^a-zA-Z0-9]+`)
+
+	words := strings.Fields(content)
+	var tokens []string
+	for _, word := range words {
+		word = nonAlphaNumeric.ReplaceAllString(strings.ToLower(word), "")
+		if word != "" && !stopWords[word] {
+			tokens = append(tokens, word)
+		}
+	}
+	return tokens
+}
+
+// FuzzyMatch checks if two strings are within a given Levenshtein distance.
+func FuzzyMatch(a, b string, maxDistance int) bool {
+	return levenshteinDistance(a, b) <= maxDistance
+}
+
+// LevenshteinDistance calculates the edit distance between two strings.
+func levenshteinDistance(a, b string) int {
+	m, n := len(a), len(b)
+	dp := make([][]int, m+1)
+	for i := range dp {
+		dp[i] = make([]int, n+1)
+	}
+
+	for i := 0; i <= m; i++ {
+		for j := 0; j <= n; j++ {
+			if i == 0 {
+				dp[i][j] = j
+			} else if j == 0 {
+				dp[i][j] = i
+			} else if a[i-1] == b[j-1] {
+				dp[i][j] = dp[i-1][j-1]
+			} else {
+				dp[i][j] = 1 + min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1])
+			}
+		}
+	}
+	return dp[m][n]
+}
+
+// Min helper function.
+func min(a, b, c int) int {
+	if a < b && a < c {
+		return a
+	} else if b < c {
+		return b
+	}
+	return c
 }

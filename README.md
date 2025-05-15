@@ -67,7 +67,6 @@ Creates an *empty* index.
 ```json
 {
   "indexName": "products",
-  "indexedCount": 0,
   "duration": "123µs",
   "durationMs": 0
 }

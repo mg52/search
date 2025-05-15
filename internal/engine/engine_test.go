@@ -1,14 +1,20 @@
-package search
+package engine
 
 import (
 	_ "embed"
 	"encoding/json"
+	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
+
+	searchkeys "github.com/mg52/search/internal/pkg/keys"
+	"github.com/mg52/search/internal/pkg/trie"
 )
 
-//go:embed test_data/products.json
+//go:embed testdata/products.json
 var testProductsJSON []byte
 
 func TestOneTermSearchWithFilter(t *testing.T) {
@@ -192,7 +198,7 @@ func TestSearchEngineControllerFlow(t *testing.T) {
 		[]string{"name", "tags"},
 		filtersConfig,
 		10, // pageCount
-		1,  // workers
+		4,  // workers
 	)
 	sec.Index(docs)
 
@@ -285,8 +291,8 @@ func TestSearchEngineControllerFlow(t *testing.T) {
 func setupEngineWithKeys(keys []string) *SearchEngine {
 	// Initialize engine
 	se := &SearchEngine{
-		Keys: NewKeys(),
-		Trie: NewTrie(),
+		Keys: searchkeys.NewKeys(),
+		Trie: trie.NewTrie(),
 	}
 	// Insert each key into Keys and Trie
 	for _, k := range keys {
@@ -508,6 +514,38 @@ func TestCombineResults(t *testing.T) {
 	}
 }
 
+func TestSaveAllShards_WriteToDisk(t *testing.T) {
+	// Prepare a temporary base directory and symlink it to /data
+	tmp := t.TempDir()
+	// Clean up any existing /data
+	_ = os.RemoveAll("/data")
+	// Symlink /data -> tmp
+	if err := os.Symlink(tmp, "/data"); err != nil {
+		t.Skipf("Unable to create /data symlink: %v", err)
+	}
+	defer os.Remove("/data")
+
+	// Create a controller with 2 shards
+	ctrl := NewSearchEngineController([]string{"name"}, nil, 1, 2)
+	// Index a dummy document so SaveAll writes real payload
+	docs := []map[string]interface{}{{"id": "doc1", "name": "foo"}}
+	ctrl.Index(docs)
+
+	// Call SaveAllShards
+	idx := "testidx"
+	if err := ctrl.SaveAllShards(idx); err != nil {
+		t.Fatalf("SaveAllShards failed: %v", err)
+	}
+
+	// Check that /data/testidx/shard-0.engine.gob exists
+	for i := 0; i < 2; i++ {
+		path := filepath.Join(tmp, idx, "shard-"+fmt.Sprint(i)+".engine.gob")
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("expected file %s, got error: %v", path, err)
+		}
+	}
+}
+
 // TestAddToDocumentIndex verifies that addToDocumentIndex correctly updates Data, Keys, and Trie.
 func TestAddToDocumentIndex(t *testing.T) {
 	// create a fresh SearchEngine
@@ -597,5 +635,228 @@ func TestBuildDocumentIndex(t *testing.T) {
 		t.Errorf("FilterDocs missing key %q", wantFilter)
 	} else if !ds["1"] {
 		t.Errorf("FilterDocs[%q][\"1\"] = false; want true", wantFilter)
+	}
+}
+
+// helper to create a temporary engine and index some docs
+func buildTestEngine(t *testing.T) *SearchEngine {
+	// two fields indexed, one filter on "year"
+	engine := NewSearchEngine(
+		[]string{"name", "tags"},
+		map[string]bool{"year": true},
+		2, // pageSize
+		0, // shardID unused
+	)
+	docs := []map[string]interface{}{
+		{"id": "1", "name": "apple banana", "tags": []interface{}{"fruit"}, "year": 2020},
+		{"id": "2", "name": "banana cherry", "tags": []interface{}{"fruit"}, "year": 2021},
+		{"id": "3", "name": "cherry date", "tags": []interface{}{"dry"}, "year": 2020},
+	}
+	engine.Index(0, docs)
+	return engine
+}
+
+func TestSaveLoadAll_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	prefix := filepath.Join(dir, "engine")
+	engine := buildTestEngine(t)
+
+	// save
+	if err := engine.SaveAll(prefix); err != nil {
+		t.Fatalf("SaveAll failed: %v", err)
+	}
+	// must have .engine.gob
+	if _, err := os.Stat(prefix + ".engine.gob"); err != nil {
+		t.Fatalf("expected engine file, got: %v", err)
+	}
+
+	// load
+	loaded, err := LoadAll(prefix)
+	if err != nil {
+		t.Fatalf("LoadAll failed: %v", err)
+	}
+
+	// compare Data maps
+	if !reflect.DeepEqual(loaded.Data, engine.Data) {
+		t.Errorf("Data mismatch\ngot:  %+v\nwant: %+v", loaded.Data, engine.Data)
+	}
+	// compare Documents
+	if !reflect.DeepEqual(loaded.Documents, engine.Documents) {
+		t.Errorf("Documents mismatch\ngot:  %+v\nwant: %+v", loaded.Documents, engine.Documents)
+	}
+	// compare ScoreIndex keys
+	if !reflect.DeepEqual(loaded.ScoreIndex, engine.ScoreIndex) {
+		t.Errorf("ScoreIndex mismatch\ngot:  %+v\nwant: %+v", loaded.ScoreIndex, engine.ScoreIndex)
+	}
+	// compare FilterDocs
+	if !reflect.DeepEqual(loaded.FilterDocs, engine.FilterDocs) {
+		t.Errorf("FilterDocs mismatch\ngot:  %+v\nwant: %+v", loaded.FilterDocs, engine.FilterDocs)
+	}
+}
+
+func TestSearchOneTermWithoutFilter(t *testing.T) {
+	engine := buildTestEngine(t)
+	// "banana" appears in both doc1 and doc2, same weight => order not guaranteed
+	res := engine.SearchOneTermWithoutFilter("banana", 0)
+	if len(res) != 2 {
+		t.Fatalf("expected 2 results for banana, got %d", len(res))
+	}
+	seen := map[string]bool{res[0].ID: true, res[1].ID: true}
+	if !seen["1"] || !seen["2"] {
+		t.Errorf("banana search missing docs, got %v", res)
+	}
+}
+
+func TestApplyFilter(t *testing.T) {
+	engine := buildTestEngine(t)
+	// filter year=2020 should select doc1 and doc3
+	m := engine.ApplyFilter(map[string][]interface{}{"year": {2020}})
+	want := map[string]bool{"1": true, "3": true}
+	if !reflect.DeepEqual(m, want) {
+		t.Errorf("ApplyFilter got %v, want %v", m, want)
+	}
+}
+
+func TestSearchOneTermWithFilter(t *testing.T) {
+	engine := buildTestEngine(t)
+	// filter year=2020 and search "cherry": doc3 only
+	res := engine.SearchOneTermWithFilter("cherry", map[string][]interface{}{"year": {2020}}, 0)
+	if len(res) != 1 || res[0].ID != "3" {
+		t.Errorf("expected doc3, got %v", res)
+	}
+}
+
+func TestSearchMultipleTermsWithoutFilter(t *testing.T) {
+	engine := buildTestEngine(t)
+	// multi-term: exact matches ["apple","date"] → only doc3 has date but not apple; doc1 has apple but not date → none
+	queries := map[string][]string{
+		"exact":  {"apple", "date"},
+		"prefix": nil,
+		"fuzzy":  nil,
+	}
+	res := engine.SearchMultipleTermsWithoutFilter(queries, 0)
+	if len(res) != 0 {
+		t.Errorf("expected no docs, got %v", res)
+	}
+	// two terms ["banana","cherry"] → doc2 matches both
+	queries["exact"] = []string{"banana", "cherry"}
+	res = engine.SearchMultipleTermsWithoutFilter(queries, 0)
+	if len(res) != 1 || res[0].ID != "2" {
+		t.Errorf("expected doc2, got %v", res)
+	}
+}
+
+func TestSearchMultipleTermsWithFilter(t *testing.T) {
+	engine := buildTestEngine(t)
+	// multi-term with filter year=2020: exact ["apple","banana"] only doc1
+	queries := map[string][]string{"exact": {"apple", "banana"}, "prefix": nil, "fuzzy": nil}
+	res := engine.SearchMultipleTermsWithFilter(queries, map[string][]interface{}{"year": {2020}}, 0)
+	if len(res) != 1 || res[0].ID != "1" {
+		t.Errorf("expected doc1, got %v", res)
+	}
+}
+
+func TestEndToEnd_Search(t *testing.T) {
+	engine := buildTestEngine(t)
+
+	// exact one term
+	sr := engine.Search("apple", 0, nil)
+	if sr == nil || !sr.IsExact || len(sr.Docs) != 1 || sr.Docs[0].ID != "1" {
+		t.Errorf("Search apple exact failed: %+v", sr)
+	}
+
+	// prefix
+	sr = engine.Search("cher", 0, nil)
+	if sr == nil || !sr.IsPrefix || len(sr.Docs) != 2 {
+		t.Errorf("Search cher prefix failed: %+v", sr)
+	}
+
+	// fuzzy ("aple" -> apple)
+	sr = engine.Search("aple", 0, nil)
+	if sr == nil || !sr.IsFuzzy || len(sr.Docs) != 1 || sr.Docs[0].ID != "1" {
+		t.Errorf("Search aple fuzzy failed: %+v", sr)
+	}
+
+	// multi-term
+	sr = engine.Search("banana cherry", 0, nil)
+	if sr == nil || !sr.IsMultiTerm || len(sr.Docs) != 1 || sr.Docs[0].ID != "2" {
+		t.Errorf("Search multi failed: %+v", sr)
+	}
+
+	// with filter
+	sr = engine.Search("banana", 0, map[string][]interface{}{"year": {2020}})
+	if sr == nil || !sr.IsExact || len(sr.Docs) != 1 || sr.Docs[0].ID != "1" {
+		t.Errorf("Search banana with filter failed: %+v", sr)
+	}
+}
+
+func TestAddAndRemoveDocument(t *testing.T) {
+	engine := buildTestEngine(t)
+	// add single new doc
+	doc4 := map[string]interface{}{"id": "4", "name": "egg fruit", "tags": []interface{}{"fresh"}, "year": 2022}
+	engine.addDocument(doc4)
+	if _, ok := engine.Documents["4"]; !ok {
+		t.Fatal("addDocument did not insert doc4")
+	}
+	// ensure searchable
+	sr := engine.Search("egg", 0, nil)
+	if sr == nil || sr.Docs[0].ID != "4" {
+		t.Errorf("Search egg after add failed: %+v", sr)
+	}
+
+	// remove
+	engine.removeDocumentByID("4")
+	if _, ok := engine.Documents["4"]; ok {
+		t.Error("removeDocumentByID did not delete doc4")
+	}
+	sr = engine.Search("egg", 0, nil)
+	// Accept either no SearchResult or an empty Docs slice
+	if sr != nil && len(sr.Docs) != 0 {
+		t.Errorf("expected no results after remove, got %+v", sr)
+	}
+}
+
+func TestTokenize(t *testing.T) {
+	input := "Hello, WORLD! 123 Go-Lang_test."
+	got := Tokenize(input)
+	want := []string{"hello", "world", "123", "golangtest"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("tokenize(%q) = %v; want %v", input, got, want)
+	}
+}
+
+func TestLevenshteinDistance(t *testing.T) {
+	tests := []struct {
+		a, b string
+		want int
+	}{
+		{"", "", 0},
+		{"a", "", 1},
+		{"", "abc", 3},
+		{"kitten", "sitting", 3},
+		{"flaw", "lawn", 2},
+	}
+	for _, tc := range tests {
+		if got := levenshteinDistance(tc.a, tc.b); got != tc.want {
+			t.Errorf("levenshteinDistance(%q,%q) = %d; want %d", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
+func TestFuzzyMatch(t *testing.T) {
+	tests := []struct {
+		a, b    string
+		maxDist int
+		want    bool
+	}{
+		{"kitten", "sitting", 3, true},
+		{"kitten", "sitting", 2, false},
+		{"flaw", "lawn", 2, true},
+		{"flaw", "lawn", 1, false},
+	}
+	for _, tc := range tests {
+		if got := FuzzyMatch(tc.a, tc.b, tc.maxDist); got != tc.want {
+			t.Errorf("FuzzyMatch(%q,%q,%d) = %v; want %v", tc.a, tc.b, tc.maxDist, got, tc.want)
+		}
 	}
 }

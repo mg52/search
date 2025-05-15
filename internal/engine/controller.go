@@ -1,4 +1,4 @@
-package search
+package engine
 
 import (
 	"fmt"
@@ -9,15 +9,20 @@ import (
 	"sync"
 )
 
+// SearchEngineController manages multiple SearchEngine shards, providing
+// parallel indexing, searching, persistence, and document updates.
 type SearchEngineController struct {
-	Engines           []*SearchEngine
-	SearchEngineCount int
-	IndexFields       []string
-	Filters           map[string]bool
-	PageSize          int
-	Weights           map[string]int
+	Engines           []*SearchEngine // individual shard instances
+	SearchEngineCount int             // number of shards
+	IndexFields       []string        // document fields to index
+	Filters           map[string]bool // fields available for filtering
+	PageSize          int             // results per page
+	Weights           map[string]int  // optional per-field weights
 }
 
+// NewSearchEngineController constructs a controller with the given configuration.
+// It creates `searchEngineCount` shards, each initialized with the same indexFields,
+// filters, and pageSize. Returns the controller ready for indexing and searching.
 func NewSearchEngineController(indexFields []string,
 	filters map[string]bool,
 	pageSize,
@@ -36,33 +41,8 @@ func NewSearchEngineController(indexFields []string,
 	}
 }
 
-// // SaveAllShards persists every shard (SearchEngine) in the controller to disk in parallel.
-// // It will spawn one goroutine per shard, each calling that engine’s SaveAll with prefix "<prefix>-<shardID>".
-// // If any shard fails, it captures the first error and returns it after all saves complete.
-// func (sec *SearchEngineController) SaveAllShards(prefix string) error {
-// 	var wg sync.WaitGroup
-// 	var once sync.Once
-// 	var saveErr error
-
-// 	for shardID, engine := range sec.Engines {
-// 		wg.Add(1)
-// 		go func(id int, eng *SearchEngine) {
-// 			defer wg.Done()
-// 			shardPrefix := fmt.Sprintf("%s-%d", prefix, id)
-// 			if err := eng.SaveAll(shardPrefix); err != nil {
-// 				once.Do(func() {
-// 					saveErr = fmt.Errorf("failed to save shard %d: %w", id, err)
-// 				})
-// 			}
-// 		}(shardID, engine)
-// 	}
-
-// 	wg.Wait()
-// 	return saveErr
-// }
-
-// SaveAllShards persists every shard (SearchEngine) in the controller to disk.
-// It will call each engine’s SaveAll method using a prefix of `<indexName>-shard-<shardID>`.
+// SaveAllShards persists every shard to disk under /data/<indexName>/shard-<ID>/.
+// It creates the directory if needed, then calls each shard's SaveAll() to write its files.
 func (sec *SearchEngineController) SaveAllShards(indexName string) error {
 	dir := filepath.Join("/data", indexName)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -77,6 +57,9 @@ func (sec *SearchEngineController) SaveAllShards(indexName string) error {
 	return nil
 }
 
+// Index distributes documents evenly across all shards and runs Index() in parallel.
+// Documents slice is chunked by ceil(len/docs / shardCount), and each goroutine
+// indexes its segment, then waits for all to complete.
 func (sec *SearchEngineController) Index(docs []map[string]interface{}) {
 	chunkSize := (len(docs) + sec.SearchEngineCount - 1) / sec.SearchEngineCount
 
@@ -103,6 +86,8 @@ func (sec *SearchEngineController) Index(docs []map[string]interface{}) {
 	wg.Wait()
 }
 
+// Search executes the query on all shards in parallel, then merges results.
+// Parameters: query string, page number, and filter map. Returns sorted Documents.
 func (sec *SearchEngineController) Search(query string, page int, filters map[string][]interface{}) []Document {
 	resultsChan := make(chan *SearchResult, sec.SearchEngineCount)
 	var wg sync.WaitGroup
@@ -121,11 +106,8 @@ func (sec *SearchEngineController) Search(query string, page int, filters map[st
 	return CombineResults(resultsChan)
 }
 
-// CombineResults filters and prioritizes search results:
-//  1. Multi-term results
-//  2. Exact-term results
-//  3. Prefix-term results
-//  4. Fuzzy-term results
+// CombineResults merges shard SearchResults by priority: multi-term, exact, prefix, then fuzzy.
+// It collects docs into the first non-empty category, sorts by ScoreWeight desc, and returns.
 func CombineResults(resultsChan <-chan *SearchResult) []Document {
 	var multi, exact, prefix, fuzzy []Document
 	for res := range resultsChan {
@@ -164,6 +146,7 @@ func CombineResults(resultsChan <-chan *SearchResult) []Document {
 	return returnResult
 }
 
+// RemoveDocumentByID removes the given docID from all shards in parallel.
 func (sec *SearchEngineController) RemoveDocumentByID(docID string) {
 	var wg sync.WaitGroup
 	for _, engine := range sec.Engines {
@@ -176,6 +159,8 @@ func (sec *SearchEngineController) RemoveDocumentByID(docID string) {
 	wg.Wait()
 }
 
+// AddOrUpdateDocument either updates an existing document in its shard,
+// or inserts it into a random shard if new. Guarantees a single copy.
 func (sec *SearchEngineController) AddOrUpdateDocument(doc map[string]interface{}) {
 	docID := fmt.Sprintf("%v", doc["id"])
 	isExist := false
