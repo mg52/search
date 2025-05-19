@@ -288,6 +288,60 @@ func TestSearchEngineControllerFlow(t *testing.T) {
 	}
 }
 
+func TestSearchEngineControllerFlow_Pagination(t *testing.T) {
+	var docs []map[string]interface{}
+	if err := json.Unmarshal(testProductsJSON, &docs); err != nil {
+		t.Fatalf("Failed to unmarshal test JSON: %v", err)
+	}
+
+	// Create controller
+	filtersConfig := map[string]bool{"year": true}
+	sec := NewSearchEngineController(
+		[]string{"name", "tags"},
+		filtersConfig,
+		2, // pageCount
+		1, // workers
+	)
+	sec.Index(docs)
+
+	emptyFilters := make(map[string][]interface{})
+
+	result := sec.Search("optimal afford", 0, emptyFilters)
+	if len(result) != 2 {
+		t.Errorf("expected 2 results for 'optimal afford', got %d: %#v", len(result), result)
+	}
+	if result[0].ID != "15" || result[0].ScoreWeight != 100000 {
+		t.Errorf("Expected 1. document ID is 15, score is 100000, got ID: %v, Score: %d",
+			result[0].ID, result[0].ScoreWeight)
+	}
+	if !((result[1].ID == "13" || result[1].ID == "19") && result[1].ScoreWeight == 66666) {
+		t.Errorf("Expected 2. document ID is 13 or 19, score is 66666, got ID: %v, Score: %d",
+			result[1].ID, result[1].ScoreWeight)
+	}
+
+	result = sec.Search("optimal afford", 1, emptyFilters)
+	if len(result) != 2 {
+		t.Errorf("expected 2 results for 'optimal afford', got %d: %#v", len(result), result)
+	}
+	if !((result[0].ID == "13" || result[0].ID == "19") && result[0].ScoreWeight == 66666) {
+		t.Errorf("Expected 1. document ID is 13 or 19, score is 66666, got ID: %v, Score: %d",
+			result[0].ID, result[0].ScoreWeight)
+	}
+	if result[1].ID != "17" || result[1].ScoreWeight != 50000 {
+		t.Errorf("Expected 2. document ID is 17, score is 50000, got ID: %v, Score: %d",
+			result[1].ID, result[1].ScoreWeight)
+	}
+
+	result = sec.Search("optimal afford", 2, emptyFilters)
+	if len(result) != 1 {
+		t.Errorf("expected 1 results for 'optimal afford', got %d: %#v", len(result), result)
+	}
+	if result[0].ID != "14" || result[0].ScoreWeight != 60000 {
+		t.Errorf("Expected 1. document ID is 14, score is 60000, got ID: %v, Score: %d",
+			result[0].ID, result[0].ScoreWeight)
+	}
+}
+
 func setupEngineWithKeys(keys []string) *SearchEngine {
 	// Initialize engine
 	se := &SearchEngine{
@@ -451,9 +505,9 @@ func TestCombineResults(t *testing.T) {
 		}
 	}
 	// build some documents
-	a := Document{"A", 10}
-	b := Document{"B", 20}
-	c := Document{"C", 5}
+	a := Document{"A", nil, 10}
+	b := Document{"B", nil, 20}
+	c := Document{"C", nil, 5}
 
 	tests := []struct {
 		name     string

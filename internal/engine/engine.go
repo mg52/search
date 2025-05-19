@@ -18,6 +18,7 @@ import (
 // Document represents a search result with an ID and its computed weight.
 type Document struct {
 	ID          string
+	Data        map[string]interface{}
 	ScoreWeight int
 }
 
@@ -170,10 +171,16 @@ func LoadAll(path string) (*SearchEngine, error) {
 
 // Index wraps BuildDocumentIndex, BuildScoreIndex, and InsertDocs with timing logs.
 func (se *SearchEngine) Index(shardID int, docs []map[string]interface{}) {
-	fmt.Println("BuildDocumentIndex starting...")
+	fmt.Println("Insert documents starting...")
 	start := time.Now()
-	se.BuildDocumentIndex(docs)
+	se.InsertDocs(docs)
 	duration := time.Since(start)
+	fmt.Printf("Insert documents took: %s\n", duration)
+
+	fmt.Println("BuildDocumentIndex starting...")
+	start = time.Now()
+	se.BuildDocumentIndex(docs)
+	duration = time.Since(start)
 	fmt.Printf("BuildDocumentIndex took: %s\n", duration)
 
 	fmt.Println("BuildScoreIndex starting...")
@@ -181,12 +188,6 @@ func (se *SearchEngine) Index(shardID int, docs []map[string]interface{}) {
 	se.BuildScoreIndex()
 	duration = time.Since(start)
 	fmt.Printf("BuildScoreIndex took: %s\n", duration)
-
-	fmt.Println("Insert documents starting...")
-	start = time.Now()
-	se.InsertDocs(docs)
-	duration = time.Since(start)
-	fmt.Printf("Insert documents took: %s\n", duration)
 }
 
 // ProcessQuery analyzes a search query string and categorizes tokens based on match type.
@@ -243,7 +244,7 @@ func (se *SearchEngine) BuildScoreIndex() {
 			for key := range keysCh {
 				var tempArr []Document
 				for docID, weight := range se.Data[key] {
-					tempArr = append(tempArr, Document{ID: docID, ScoreWeight: weight})
+					tempArr = append(tempArr, Document{ID: docID, ScoreWeight: weight, Data: se.Documents[docID]})
 				}
 				sort.Slice(tempArr, func(i, j int) bool {
 					return tempArr[i].ScoreWeight > tempArr[j].ScoreWeight
@@ -291,13 +292,6 @@ func (se *SearchEngine) BuildDocumentIndex(docs []map[string]interface{}) {
 		}
 
 		docID := fmt.Sprintf("%v", doc["id"])
-		se.mu.RLock()
-		_, ok := se.Documents[docID]
-		se.mu.RUnlock()
-		if ok {
-			fmt.Println("Document already exist, removing and readding, DocID:", i)
-			se.removeDocumentByID(docID)
-		}
 
 		var allTokens []string
 		for _, weightField := range se.IndexFields {
@@ -512,6 +506,7 @@ func (se *SearchEngine) searchAllWithoutFilter(exactTerms, otherTerms []string, 
 
 		finalDocs = append(finalDocs, Document{
 			ID:          doc.ID,
+			Data:        se.Documents[doc.ID],
 			ScoreWeight: totalScore,
 		})
 		if len(finalDocs) >= stopIndex {
@@ -585,6 +580,7 @@ func (se *SearchEngine) searchAllWithFilter(exactTerms, otherTerms []string, fil
 
 		finalDocs = append(finalDocs, Document{
 			ID:          doc.ID,
+			Data:        se.Documents[doc.ID],
 			ScoreWeight: totalScore,
 		})
 		if len(finalDocs) >= stopIndex {

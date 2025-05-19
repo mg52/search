@@ -160,9 +160,11 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.PageCount <= 0 {
+		// Default page count for each shard is 10.
 		req.PageCount = 10
 	}
 	if req.Workers <= 0 {
+		// Default worker count is 8.
 		req.Workers = 8
 	}
 
