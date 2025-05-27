@@ -248,7 +248,11 @@ go test -count=1 ./...
 go test -race -count=1 ./...
 
 # With coverage report
-go test -cover ./...
+go test -race -count=1 ./... \
+  -coverpkg=./... \
+  -coverprofile=coverage.out
+
+go tool cover -func=coverage.out
 ```
 
 ---

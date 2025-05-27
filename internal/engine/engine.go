@@ -195,7 +195,7 @@ func (se *SearchEngine) Index(shardID int, docs []map[string]interface{}) {
 // - "exact": tokens that exactly match entries in the GlobalKeys store.
 // - "prefix": tokens that match prefixes found in the GlobalTrie.
 // - "fuzzy": tokens that approximately match entries in GlobalKeys within a given edit distance.
-func (sec *SearchEngine) ProcessQuery(query string) map[string][]string {
+func (se *SearchEngine) ProcessQuery(query string) map[string][]string {
 	queryTokens := Tokenize(query)
 	if len(queryTokens) == 0 {
 		return nil
@@ -203,17 +203,38 @@ func (sec *SearchEngine) ProcessQuery(query string) map[string][]string {
 
 	result := make(map[string][]string)
 
-	for _, query := range queryTokens {
-		if _, exists := sec.Keys.GetData()[query]; exists {
-			result["exact"] = append(result["exact"], query)
-			continue
-		} else {
-			guessArr := sec.Trie.SearchPrefix(query)
+	// for _, query := range queryTokens {
+	// 	if _, exists := se.Keys.GetData()[query]; exists {
+	// 		result["exact"] = append(result["exact"], query)
+	// 		continue
+	// 	} else {
+	// 		guessArr := se.Trie.SearchPrefix(query)
+	// 		if guessArr != nil {
+	// 			result["prefix"] = append(result["prefix"], guessArr...)
+	// 		} else {
+	// 			fuzzyMatch := false
+	// 			for key := range se.Keys.GetData() {
+	// 				if FuzzyMatch(key, query, 2) {
+	// 					result["fuzzy"] = append(result["fuzzy"], key)
+	// 					fuzzyMatch = true
+	// 					break
+	// 				}
+	// 			}
+	// 			if !fuzzyMatch {
+	// 				result["fuzzy"] = append(result["fuzzy"], query)
+	// 			}
+	// 		}
+	// 	}
+	// }
+
+	if len(queryTokens) == 1 {
+		for _, query := range queryTokens {
+			guessArr := se.Trie.SearchPrefix(query)
 			if guessArr != nil {
 				result["prefix"] = append(result["prefix"], guessArr...)
 			} else {
 				fuzzyMatch := false
-				for key := range sec.Keys.GetData() {
+				for key := range se.Keys.GetData() {
 					if FuzzyMatch(key, query, 2) {
 						result["fuzzy"] = append(result["fuzzy"], key)
 						fuzzyMatch = true
@@ -223,6 +244,27 @@ func (sec *SearchEngine) ProcessQuery(query string) map[string][]string {
 				if !fuzzyMatch {
 					result["fuzzy"] = append(result["fuzzy"], query)
 				}
+			}
+		}
+	} else {
+		lastWord := queryTokens[len(queryTokens)-1]
+		result["exact"] = append(result["exact"], queryTokens[:len(queryTokens)-1]...)
+		// TODO: her bir iterasyonda eger az data var ise sonraki prefix arrayden sececek sekilde update et
+		// sadece 5 tane prefix tahmininden degil. hic yok ise en son fuzzy dene.
+		guessArr := se.Trie.SearchPrefix(lastWord)
+		if guessArr != nil {
+			result["prefix"] = append(result["prefix"], guessArr...)
+		} else {
+			fuzzyMatch := false
+			for key := range se.Keys.GetData() {
+				if FuzzyMatch(key, lastWord, 2) {
+					result["fuzzy"] = append(result["fuzzy"], key)
+					fuzzyMatch = true
+					break
+				}
+			}
+			if !fuzzyMatch {
+				result["fuzzy"] = append(result["fuzzy"], lastWord)
 			}
 		}
 	}
@@ -610,15 +652,7 @@ func (se *SearchEngine) SearchMultipleTermsWithFilter(queriesMap map[string][]st
 	return result
 }
 
-// Search executes a full query (possibly multi-term) with optional filters,
-// selecting the correct search path (exact, prefix, fuzzy, or multi-term).
-func (se *SearchEngine) Search(query string, page int, filters map[string][]interface{}) *SearchResult {
-	queryTokens := se.ProcessQuery(query)
-	fmt.Println("ProcessQuery:", queryTokens)
-	if queryTokens == nil {
-		return nil
-	}
-
+func (se *SearchEngine) searchWithTokens(queryTokens map[string][]string, page int, filters map[string][]interface{}) *SearchResult {
 	if len(filters) == 0 {
 		if len(queryTokens["exact"]) == 1 &&
 			len(queryTokens["prefix"]) == 0 &&
@@ -635,9 +669,13 @@ func (se *SearchEngine) Search(query string, page int, filters map[string][]inte
 
 		if len(queryTokens["exact"]) == 0 {
 			if len(queryTokens["prefix"]) > 0 {
-				resultDocs := se.SearchOneTermWithoutFilter(queryTokens["prefix"][0], page)
+				var finalDocs []Document
+				for _, query := range queryTokens["prefix"] {
+					finalDocs = append(finalDocs, se.SearchOneTermWithoutFilter(query, page)...)
+				}
+				// resultDocs := se.SearchOneTermWithoutFilter(queryTokens["prefix"][0], page)
 				return &SearchResult{
-					Docs:        resultDocs,
+					Docs:        finalDocs,
 					IsMultiTerm: false,
 					IsFuzzy:     false,
 					IsPrefix:    true,
@@ -710,6 +748,58 @@ func (se *SearchEngine) Search(query string, page int, filters map[string][]inte
 			IsExact:     true,
 		}
 	}
+}
+
+// Search executes a full query (possibly multi-term) with optional filters,
+// selecting the correct search path (exact, prefix, fuzzy, or multi-term).
+func (se *SearchEngine) Search(query string, page int, filters map[string][]interface{}) *SearchResult {
+	// if queryTokens length = 1,
+
+	// if it is exact, get exacts and append prefixes in the same response.
+	// or get all like prefix.
+	// if empty or less than a threshold, go with fuzzy
+
+	// if it is prefix, get prefixes.
+	// if empty or less than a threshold, go with fuzzy
+
+	// if it is fuzzy, get fuzzies.
+
+	// ----
+
+	// if queryTokens length = 2,
+
+	// first word should be exact, if not, go like queryTokens length = 1, take the first word.
+
+	// if the first word is exact, then get the second word exacts and prefixes
+	// if empty or less than a threshold, go with fuzzy
+
+	// ----
+
+	// if queryTokens length > 2,
+	// same like above ...
+
+	queryTokens := se.ProcessQuery(query)
+	fmt.Println("ProcessQuery:", queryTokens)
+	if queryTokens == nil {
+		return nil
+	}
+
+	result := se.searchWithTokens(queryTokens, page, filters)
+	// if len(result.Docs) <= 3 {
+	// 	if len(queryTokens["exact"]) > 0 {
+	// 		lastExactToken := queryTokens["exact"][len(queryTokens["exact"])-1]
+	// 		queryTokens["exact"] = queryTokens["exact"][:len(queryTokens["exact"])-1]
+	// 		guessArr := se.Trie.SearchPrefix(lastExactToken)
+	// 		if guessArr != nil {
+	// 			queryTokens["prefix"] = append(queryTokens["prefix"], guessArr...)
+	// 		}
+	// 		fmt.Println("ProcessQuery 2:", queryTokens)
+	// 		result2 := se.searchWithTokens(queryTokens, page, filters)
+	// 		result2.Docs = append(result2.Docs, result.Docs...)
+	// 		return result2
+	// 	}
+	// }
+	return result
 }
 
 // addScoreIndex inserts or updates the score entry for a document across multiple tokens,

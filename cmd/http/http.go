@@ -1,6 +1,8 @@
 package http
 
 import (
+	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,12 +37,14 @@ type CreateIndexRequest struct {
 	IndexFields []string `json:"indexFields"`
 	Filters     []string `json:"filters"`
 	PageCount   int      `json:"pageCount"`
-	Workers     int      `json:"workers"`
+	Shards      int      `json:"shards"`
 }
 
 // CreateIndexResponse is returned on succressful index creation.
 type CreateIndexResponse struct {
 	IndexName string `json:"indexName"`
+	PageCount int    `json:"pageCount"`
+	Shards    int    `json:"shards"`
 	Duration  string `json:"duration"`
 }
 
@@ -160,12 +164,12 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.PageCount <= 0 {
-		// Default page count for each shard is 10.
-		req.PageCount = 10
+		// Default page count for each shard is 15.
+		req.PageCount = 15
 	}
-	if req.Workers <= 0 {
-		// Default worker count is 8.
-		req.Workers = 8
+	if req.Shards <= 0 {
+		// Default worker count is 4.
+		req.Shards = 4
 	}
 
 	filterMap := make(map[string]bool, len(req.Filters))
@@ -178,7 +182,7 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 		req.IndexFields,
 		filterMap,
 		req.PageCount,
-		req.Workers,
+		req.Shards,
 	)
 	elapsed := time.Since(start)
 
@@ -190,6 +194,8 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(CreateIndexResponse{
 		IndexName: req.IndexName,
+		PageCount: req.PageCount,
+		Shards:    req.Shards,
 		Duration:  elapsed.String(),
 	})
 }
@@ -233,10 +239,29 @@ func (ht *HTTP) AddToIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// try JSON first
 	var docs []map[string]interface{}
 	if err := json.Unmarshal(raw, &docs); err != nil {
-		ErrWriter(w, fmt.Errorf("invalid JSON in file: %w", err))
-		return
+		// not JSON → try CSV
+		rdr := csv.NewReader(bytes.NewReader(raw))
+		rows, err2 := rdr.ReadAll()
+		if err2 != nil || len(rows) < 2 {
+			ErrWriter(w, fmt.Errorf("invalid JSON or CSV in file: %v / %v", err, err2))
+			return
+		}
+		headers := rows[0]
+		docs = make([]map[string]interface{}, 0, len(rows)-1)
+		for _, row := range rows[1:] {
+			doc := make(map[string]interface{}, len(headers))
+			for i, h := range headers {
+				if i < len(row) {
+					doc[h] = row[i]
+				} else {
+					doc[h] = ""
+				}
+			}
+			docs = append(docs, doc)
+		}
 	}
 
 	start := time.Now()
