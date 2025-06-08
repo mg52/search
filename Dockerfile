@@ -15,7 +15,7 @@ RUN go mod download
 # Copy source and build statically
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -trimpath -ldflags="-s -w" -o /searchengine .
+    go build -trimpath -ldflags="-s -w" -o /searchengine ./cmd/service
 
 ############################
 # 2) Production stage
@@ -40,4 +40,4 @@ EXPOSE 8080
 VOLUME ["/data"]
 
 # Run the binary with data-dir flag
-ENTRYPOINT ["/usr/local/bin/searchengine", "--data-dir", "/data"]
+ENTRYPOINT ["/usr/local/bin/searchengine"]

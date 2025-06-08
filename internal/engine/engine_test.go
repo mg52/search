@@ -374,7 +374,7 @@ func TestProcessQuery(t *testing.T) {
 			keys:  []string{"foo", "bar"},
 			query: "foo",
 			expected: map[string][]string{
-				"exact": {"foo"},
+				"prefix": {"foo"},
 			},
 		},
 		{
@@ -406,8 +406,8 @@ func TestProcessQuery(t *testing.T) {
 			keys:  []string{"apple", "apricot", "foo", "kite"},
 			query: "ap foo ki",
 			expected: map[string][]string{
-				"exact":  {"foo"},
-				"prefix": {"apple", "apricot", "kite"},
+				"exact":  {"ap", "foo"},
+				"prefix": {"kite"},
 			},
 		},
 	}
@@ -415,7 +415,7 @@ func TestProcessQuery(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			se := setupEngineWithKeys(tt.keys)
-			got := se.ProcessQuery(tt.query)
+			got := se.ProcessQuery(tt.query, 5)
 			if !reflect.DeepEqual(got, tt.expected) {
 				t.Errorf("ProcessQuery(%q):\n got: %#v\nwant: %#v", tt.query, got, tt.expected)
 			}
@@ -561,8 +561,14 @@ func TestCombineResults(t *testing.T) {
 			}
 			close(ch)
 			got := CombineResults(ch)
-			if !reflect.DeepEqual(got, tt.expected) {
-				t.Errorf("CombineResults = %+v, want %+v", got, tt.expected)
+			if tt.expected == nil {
+				if got != nil {
+					t.Errorf("CombineResults = %+v, want %+v", got, tt.expected)
+				}
+			} else {
+				if !reflect.DeepEqual(got.Docs, tt.expected) {
+					t.Errorf("CombineResults = %+v, want %+v", got, tt.expected)
+				}
 			}
 		})
 	}
@@ -622,7 +628,7 @@ func TestAddToDocumentIndex(t *testing.T) {
 	}
 
 	// Trie should return "foo" on prefix "f"
-	pref := se.Trie.SearchPrefix("f")
+	pref := se.Trie.SearchPrefix("f", 5)
 	if !reflect.DeepEqual(pref, []string{"foo"}) {
 		t.Errorf("expected Trie.SearchPrefix(\"f\")==[\"foo\"], got %v", pref)
 	}
@@ -671,7 +677,7 @@ func TestBuildDocumentIndex(t *testing.T) {
 
 	// check Trie can find each term via SearchPrefix
 	for term := range wantData {
-		pref := se.Trie.SearchPrefix(string(term[0]))
+		pref := se.Trie.SearchPrefix(string(term[0]), 5)
 		found := false
 		for _, tkn := range pref {
 			if tkn == term {
@@ -814,32 +820,32 @@ func TestEndToEnd_Search(t *testing.T) {
 	engine := buildTestEngine(t)
 
 	// exact one term
-	sr := engine.Search("apple", 0, nil)
-	if sr == nil || !sr.IsExact || len(sr.Docs) != 1 || sr.Docs[0].ID != "1" {
+	sr := engine.Search("apple", 0, nil, 5)
+	if sr == nil || !sr.IsPrefix || len(sr.Docs) != 1 || sr.Docs[0].ID != "1" {
 		t.Errorf("Search apple exact failed: %+v", sr)
 	}
 
 	// prefix
-	sr = engine.Search("cher", 0, nil)
+	sr = engine.Search("cher", 0, nil, 5)
 	if sr == nil || !sr.IsPrefix || len(sr.Docs) != 2 {
 		t.Errorf("Search cher prefix failed: %+v", sr)
 	}
 
 	// fuzzy ("aple" -> apple)
-	sr = engine.Search("aple", 0, nil)
+	sr = engine.Search("aple", 0, nil, 5)
 	if sr == nil || !sr.IsFuzzy || len(sr.Docs) != 1 || sr.Docs[0].ID != "1" {
 		t.Errorf("Search aple fuzzy failed: %+v", sr)
 	}
 
 	// multi-term
-	sr = engine.Search("banana cherry", 0, nil)
+	sr = engine.Search("banana cherry", 0, nil, 5)
 	if sr == nil || !sr.IsMultiTerm || len(sr.Docs) != 1 || sr.Docs[0].ID != "2" {
 		t.Errorf("Search multi failed: %+v", sr)
 	}
 
 	// with filter
-	sr = engine.Search("banana", 0, map[string][]interface{}{"year": {2020}})
-	if sr == nil || !sr.IsExact || len(sr.Docs) != 1 || sr.Docs[0].ID != "1" {
+	sr = engine.Search("banana", 0, map[string][]interface{}{"year": {2020}}, 5)
+	if sr == nil || !sr.IsPrefix || len(sr.Docs) != 1 || sr.Docs[0].ID != "1" {
 		t.Errorf("Search banana with filter failed: %+v", sr)
 	}
 }
@@ -853,7 +859,7 @@ func TestAddAndRemoveDocument(t *testing.T) {
 		t.Fatal("addDocument did not insert doc4")
 	}
 	// ensure searchable
-	sr := engine.Search("egg", 0, nil)
+	sr := engine.Search("egg", 0, nil, 5)
 	if sr == nil || sr.Docs[0].ID != "4" {
 		t.Errorf("Search egg after add failed: %+v", sr)
 	}
@@ -863,7 +869,7 @@ func TestAddAndRemoveDocument(t *testing.T) {
 	if _, ok := engine.Documents["4"]; ok {
 		t.Error("removeDocumentByID did not delete doc4")
 	}
-	sr = engine.Search("egg", 0, nil)
+	sr = engine.Search("egg", 0, nil, 5)
 	// Accept either no SearchResult or an empty Docs slice
 	if sr != nil && len(sr.Docs) != 0 {
 		t.Errorf("expected no results after remove, got %+v", sr)
@@ -911,6 +917,37 @@ func TestFuzzyMatch(t *testing.T) {
 	for _, tc := range tests {
 		if got := FuzzyMatch(tc.a, tc.b, tc.maxDist); got != tc.want {
 			t.Errorf("FuzzyMatch(%q,%q,%d) = %v; want %v", tc.a, tc.b, tc.maxDist, got, tc.want)
+		}
+	}
+}
+
+func TestUpdateDocumentDataOnly(t *testing.T) {
+	engine := buildTestEngine(t)
+	// "banana" appears in both doc1 and doc2, same weight => order not guaranteed
+	res := engine.SearchOneTermWithoutFilter("cherry", 0)
+	if len(res) != 2 {
+		t.Fatalf("expected 2 results for banana, got %d", len(res))
+	}
+	seen := map[string]bool{res[0].ID: true, res[1].ID: true}
+	if !seen["2"] || !seen["3"] {
+		t.Errorf("banana search missing docs, got %v", res)
+	}
+
+	for _, doc := range res {
+		if doc.ID == "3" {
+			if doc.Data["tags"].([]interface{})[0] != "dry" {
+				t.Errorf("Wrong tag, it should be 'dry', got %v", doc.Data["tags"])
+			}
+		}
+	}
+
+	engine.Documents["3"]["tags"] = []interface{}{"dry-upd"}
+
+	for _, doc := range res {
+		if doc.ID == "3" {
+			if doc.Data["tags"].([]interface{})[0] != "dry-upd" {
+				t.Errorf("Wrong tag, it should be 'dry-upd', got %v", doc.Data["tags"])
+			}
 		}
 	}
 }

@@ -76,7 +76,7 @@ func (t *Trie) Insert(key string) {
 	node.IsEnd = true
 }
 
-func (t *Trie) SearchPrefix(prefix string) []string {
+func (t *Trie) SearchPrefix(prefix string, prefixCount int) []string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	node := t.Root
@@ -88,19 +88,38 @@ func (t *Trie) SearchPrefix(prefix string) []string {
 	}
 
 	var results []string
-	t.collectWords(node, prefix, &results)
+	t.collectWords(node, prefix, &results, prefixCount)
 	return results
 }
 
-func (t *Trie) collectWords(node *TrieNode, prefix string, results *[]string) {
-	if node.IsEnd {
-		*results = append(*results, prefix)
+func (t *Trie) collectWords(root *TrieNode, prefix string, results *[]string, prefixCount int) {
+	type entry struct {
+		node   *TrieNode
+		prefix string
 	}
-	for _, ch := range node.ChildrenArr {
-		if len(*results) >= 5 {
-			break
+
+	// start BFS from the given node/prefix
+	queue := []entry{{root, prefix}}
+	for len(queue) > 0 && len(*results) < prefixCount {
+		curr := queue[0]
+		queue = queue[1:]
+
+		// if this node marks a complete word, collect it
+		if curr.node.IsEnd {
+			*results = append(*results, curr.prefix)
+			if len(*results) >= prefixCount {
+				break
+			}
 		}
-		t.collectWords(node.Children[ch], prefix+string(ch), results)
+
+		// enqueue children in order
+		for _, ch := range curr.node.ChildrenArr {
+			child := curr.node.Children[ch]
+			queue = append(queue, entry{
+				node:   child,
+				prefix: curr.prefix + string(ch),
+			})
+		}
 	}
 }
 

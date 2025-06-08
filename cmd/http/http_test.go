@@ -236,6 +236,7 @@ func TestSaveController_Success(t *testing.T) {
 		t.Fatalf("chdir to tmp failed: %v", err)
 	}
 
+	os.Setenv("INDEX_DATA_DIR", tmp)
 	ht := NewHTTP()
 	idx := "idx"
 	ht.controllers[idx] = engine.NewSearchEngineController([]string{"name"}, nil, 1, 1)
@@ -248,7 +249,7 @@ func TestSaveController_Success(t *testing.T) {
 
 	if rr.Code == http.StatusOK {
 		// only if it's OK do we assert the file exists
-		expected := idx + "-shard-0.engine.gob"
+		expected := idx + "/shard-0.engine.gob"
 		if _, err := os.Stat(filepath.Join(tmp, expected)); err != nil {
 			t.Errorf("expected gob file %q, stat error: %v", expected, err)
 		}

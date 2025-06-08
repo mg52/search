@@ -24,11 +24,12 @@ type Document struct {
 
 // SearchResult encapsulates the result of a search on one shard.
 type SearchResult struct {
-	Docs        []Document
-	IsMultiTerm bool
-	IsExact     bool
-	IsPrefix    bool
-	IsFuzzy     bool
+	Docs         []Document
+	IsMultiTerm  bool
+	IsExact      bool
+	IsPrefix     bool
+	IsFuzzy      bool
+	PrefixLength int
 }
 
 // TokenFieldPair associates a token with its originating field (unused).
@@ -195,7 +196,7 @@ func (se *SearchEngine) Index(shardID int, docs []map[string]interface{}) {
 // - "exact": tokens that exactly match entries in the GlobalKeys store.
 // - "prefix": tokens that match prefixes found in the GlobalTrie.
 // - "fuzzy": tokens that approximately match entries in GlobalKeys within a given edit distance.
-func (se *SearchEngine) ProcessQuery(query string) map[string][]string {
+func (se *SearchEngine) ProcessQuery(query string, prefixCount int) map[string][]string {
 	queryTokens := Tokenize(query)
 	if len(queryTokens) == 0 {
 		return nil
@@ -203,33 +204,9 @@ func (se *SearchEngine) ProcessQuery(query string) map[string][]string {
 
 	result := make(map[string][]string)
 
-	// for _, query := range queryTokens {
-	// 	if _, exists := se.Keys.GetData()[query]; exists {
-	// 		result["exact"] = append(result["exact"], query)
-	// 		continue
-	// 	} else {
-	// 		guessArr := se.Trie.SearchPrefix(query)
-	// 		if guessArr != nil {
-	// 			result["prefix"] = append(result["prefix"], guessArr...)
-	// 		} else {
-	// 			fuzzyMatch := false
-	// 			for key := range se.Keys.GetData() {
-	// 				if FuzzyMatch(key, query, 2) {
-	// 					result["fuzzy"] = append(result["fuzzy"], key)
-	// 					fuzzyMatch = true
-	// 					break
-	// 				}
-	// 			}
-	// 			if !fuzzyMatch {
-	// 				result["fuzzy"] = append(result["fuzzy"], query)
-	// 			}
-	// 		}
-	// 	}
-	// }
-
 	if len(queryTokens) == 1 {
 		for _, query := range queryTokens {
-			guessArr := se.Trie.SearchPrefix(query)
+			guessArr := se.Trie.SearchPrefix(query, prefixCount)
 			if guessArr != nil {
 				result["prefix"] = append(result["prefix"], guessArr...)
 			} else {
@@ -249,9 +226,7 @@ func (se *SearchEngine) ProcessQuery(query string) map[string][]string {
 	} else {
 		lastWord := queryTokens[len(queryTokens)-1]
 		result["exact"] = append(result["exact"], queryTokens[:len(queryTokens)-1]...)
-		// TODO: her bir iterasyonda eger az data var ise sonraki prefix arrayden sececek sekilde update et
-		// sadece 5 tane prefix tahmininden degil. hic yok ise en son fuzzy dene.
-		guessArr := se.Trie.SearchPrefix(lastWord)
+		guessArr := se.Trie.SearchPrefix(lastWord, prefixCount)
 		if guessArr != nil {
 			result["prefix"] = append(result["prefix"], guessArr...)
 		} else {
@@ -391,6 +366,8 @@ func (se *SearchEngine) BuildDocumentIndex(docs []map[string]interface{}) {
 func (se *SearchEngine) addToDocumentIndex(
 	term, docID string, length int,
 ) {
+	// TODO: Popularity can be added in this function as a new parameter
+	// then popularity can be added to the normalizedWeight as a bias.
 	normalizedWeight := (100_000 / length)
 
 	se.mu.Lock()
@@ -639,6 +616,11 @@ func (se *SearchEngine) searchAllWithFilter(exactTerms, otherTerms []string, fil
 	return finalDocs[startIndex:stopIndex]
 }
 
+// TODO: if we want to order by popularity,
+// we need to make multi term search by checking ALL terms given
+// in the input in the ScoreIndex and because it is ordered by final score, we can return
+// page count amount of documents if there is matching for all terms' ScoreIndex.
+
 // SearchMultipleTermsWithoutFilter is a public wrapper for multi-term searches without filters.
 func (se *SearchEngine) SearchMultipleTermsWithoutFilter(queriesMap map[string][]string, page int) []Document {
 	result := se.searchAllWithoutFilter(queriesMap["exact"], append(queriesMap["prefix"], queriesMap["fuzzy"]...), page)
@@ -752,53 +734,23 @@ func (se *SearchEngine) searchWithTokens(queryTokens map[string][]string, page i
 
 // Search executes a full query (possibly multi-term) with optional filters,
 // selecting the correct search path (exact, prefix, fuzzy, or multi-term).
-func (se *SearchEngine) Search(query string, page int, filters map[string][]interface{}) *SearchResult {
-	// if queryTokens length = 1,
+func (se *SearchEngine) Search(query string, page int, filters map[string][]interface{}, prefixCount int) *SearchResult {
+	queryTokens := se.ProcessQuery(query, prefixCount)
+	if len(queryTokens["prefix"]) <= 5 {
+		fmt.Println("ShardID:", se.ShardID, "ProcessQuery:", queryTokens)
+	} else {
+		fmt.Println("ShardID:", se.ShardID, "ProcessQuery Lengths:",
+			len(queryTokens["exact"]),
+			len(queryTokens["prefix"]),
+			len(queryTokens["fuzzy"]))
+	}
 
-	// if it is exact, get exacts and append prefixes in the same response.
-	// or get all like prefix.
-	// if empty or less than a threshold, go with fuzzy
-
-	// if it is prefix, get prefixes.
-	// if empty or less than a threshold, go with fuzzy
-
-	// if it is fuzzy, get fuzzies.
-
-	// ----
-
-	// if queryTokens length = 2,
-
-	// first word should be exact, if not, go like queryTokens length = 1, take the first word.
-
-	// if the first word is exact, then get the second word exacts and prefixes
-	// if empty or less than a threshold, go with fuzzy
-
-	// ----
-
-	// if queryTokens length > 2,
-	// same like above ...
-
-	queryTokens := se.ProcessQuery(query)
-	fmt.Println("ProcessQuery:", queryTokens)
 	if queryTokens == nil {
 		return nil
 	}
 
 	result := se.searchWithTokens(queryTokens, page, filters)
-	// if len(result.Docs) <= 3 {
-	// 	if len(queryTokens["exact"]) > 0 {
-	// 		lastExactToken := queryTokens["exact"][len(queryTokens["exact"])-1]
-	// 		queryTokens["exact"] = queryTokens["exact"][:len(queryTokens["exact"])-1]
-	// 		guessArr := se.Trie.SearchPrefix(lastExactToken)
-	// 		if guessArr != nil {
-	// 			queryTokens["prefix"] = append(queryTokens["prefix"], guessArr...)
-	// 		}
-	// 		fmt.Println("ProcessQuery 2:", queryTokens)
-	// 		result2 := se.searchWithTokens(queryTokens, page, filters)
-	// 		result2.Docs = append(result2.Docs, result.Docs...)
-	// 		return result2
-	// 	}
-	// }
+	result.PrefixLength = len(queryTokens["prefix"])
 	return result
 }
 

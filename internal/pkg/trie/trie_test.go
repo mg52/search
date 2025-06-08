@@ -16,7 +16,7 @@ func TestInsertAndSearch(t *testing.T) {
 	}
 
 	t.Run("SearchPrefix 'app'", func(t *testing.T) {
-		got := tr.SearchPrefix("app")
+		got := tr.SearchPrefix("app", 5)
 		exp := []string{"app", "apple"}
 		if !reflect.DeepEqual(got, exp) {
 			t.Errorf("SearchPrefix(\"app\") = %v; want %v", got, exp)
@@ -24,7 +24,7 @@ func TestInsertAndSearch(t *testing.T) {
 	})
 
 	t.Run("SearchPrefix 'ban'", func(t *testing.T) {
-		got := tr.SearchPrefix("ban")
+		got := tr.SearchPrefix("ban", 5)
 		exp := []string{"banana"}
 		if !reflect.DeepEqual(got, exp) {
 			t.Errorf("SearchPrefix(\"ban\") = %v; want %v", got, exp)
@@ -32,8 +32,25 @@ func TestInsertAndSearch(t *testing.T) {
 	})
 
 	t.Run("Search non-existent prefix", func(t *testing.T) {
-		if got := tr.SearchPrefix("xyz"); got != nil {
+		if got := tr.SearchPrefix("xyz", 5); got != nil {
 			t.Errorf("SearchPrefix(\"xyz\") = %v; want nil", got)
+		}
+	})
+}
+
+func TestInsertAndSearch_LargeKeys(t *testing.T) {
+	tr := NewTrie()
+	// insert some keys
+	keys := []string{"app", "apple", "appl", "appf", "appc", "appfe", "appce", "appde", "appced"}
+	for _, k := range keys {
+		tr.Insert(k)
+	}
+
+	t.Run("SearchPrefix 'app'", func(t *testing.T) {
+		got := tr.SearchPrefix("app", 5)
+		exp := []string{"app", "appl", "appf", "appc", "apple"}
+		if !reflect.DeepEqual(got, exp) {
+			t.Errorf("SearchPrefix(\"app\") = %v; want %v", got, exp)
 		}
 	})
 }
@@ -50,7 +67,7 @@ func TestRemove(t *testing.T) {
 		if err := tr.Remove("apple"); err != nil {
 			t.Fatalf("Remove(\"apple\") error: %v", err)
 		}
-		got := tr.SearchPrefix("app")
+		got := tr.SearchPrefix("app", 5)
 		exp := []string{"app", "appol"}
 		if !reflect.DeepEqual(got, exp) {
 			t.Errorf("After Remove apple, SearchPrefix(\"app\") = %v; want %v", got, exp)
@@ -61,7 +78,7 @@ func TestRemove(t *testing.T) {
 		if err := tr.Remove("appol"); err != nil {
 			t.Fatalf("Remove(\"apple\") error: %v", err)
 		}
-		got := tr.SearchPrefix("app")
+		got := tr.SearchPrefix("app", 5)
 		exp := []string{"app"}
 		if !reflect.DeepEqual(got, exp) {
 			t.Errorf("After Remove apple, SearchPrefix(\"app\") = %v; want %v", got, exp)
@@ -73,7 +90,7 @@ func TestRemove(t *testing.T) {
 		if err := tr.Remove("app"); err != nil {
 			t.Fatalf("Remove(\"app\") error: %v", err)
 		}
-		if got := tr.SearchPrefix("app"); len(got) != 0 {
+		if got := tr.SearchPrefix("app", 5); len(got) != 0 {
 			t.Errorf("After Remove app, SearchPrefix(\"app\") = %v; want empty", got)
 		}
 	})
@@ -110,7 +127,7 @@ func TestSaveLoadTrie_RoundTrip(t *testing.T) {
 	}
 
 	// Verify that SearchPrefix("ap") returns the inserted "apple" and "apricot"
-	got := loaded.SearchPrefix("ap")
+	got := loaded.SearchPrefix("ap", 5)
 	want := []string{"apple", "apricot"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("SearchPrefix(\"ap\") = %v; want %v", got, want)
@@ -131,7 +148,7 @@ func TestLoadTrie_Nonexistent(t *testing.T) {
 	}
 
 	// An empty trie should return nil for any prefix
-	if res := tr.SearchPrefix("anything"); res != nil {
+	if res := tr.SearchPrefix("anything", 5); res != nil {
 		t.Errorf("expected nil on SearchPrefix on empty trie, got: %v", res)
 	}
 }
@@ -158,13 +175,13 @@ func TestTrie_Update_NewKeyInserted(t *testing.T) {
 	}
 
 	// Collect all keys starting with 'apr'
-	rst := tr.SearchPrefix("apr")
+	rst := tr.SearchPrefix("apr", 5)
 	if !reflect.DeepEqual(rst, []string{"apricot"}) {
 		t.Errorf("SearchPrefix(apr) = %v; want [apricot]", rst)
 	}
 
 	// Ensure 'banana' still present
-	if rst2 := tr.SearchPrefix("ban"); !reflect.DeepEqual(rst2, []string{"banana"}) {
+	if rst2 := tr.SearchPrefix("ban", 5); !reflect.DeepEqual(rst2, []string{"banana"}) {
 		t.Errorf("SearchPrefix(ban) = %v; want [banana]", rst2)
 	}
 }
