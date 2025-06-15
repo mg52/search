@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -164,8 +162,8 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.PageCount <= 0 {
-		// Default page count for each shard is 15.
-		req.PageCount = 15
+		// Default page count for each shard is 10.
+		req.PageCount = 10
 	}
 	if req.Shards <= 0 {
 		// Default worker count is 4.
@@ -495,70 +493,18 @@ func (ht *HTTP) LoadController(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ht.mu.Lock()
-	_, exists := ht.controllers[req.IndexName]
+	sec, exists := ht.controllers[req.IndexName]
 	if !exists {
 		ht.controllers[req.IndexName] = &engine.SearchEngineController{}
+		sec = ht.controllers[req.IndexName]
 	}
 	ht.mu.Unlock()
-
-	dataDir := filepath.Join("/data", req.IndexName)
-	shardCount := 0
-	for {
-		shardPrefix := fmt.Sprintf("shard-%d", shardCount)
-		dir := filepath.Join(dataDir, shardPrefix)
-		engineFile := fmt.Sprintf("%s.engine.gob", dir)
-		if _, err := os.Stat(engineFile); os.IsNotExist(err) {
-			break
-		}
-		shardCount++
-	}
-	if shardCount == 0 {
-		ErrWriter(w, fmt.Errorf("no shard files found with prefix %q", req.IndexName))
-		return
-	}
 
 	start := time.Now()
-	engines := make([]*engine.SearchEngine, shardCount)
-	var wg sync.WaitGroup
-	var loadErr error
-	var once sync.Once
-
-	for id := 0; id < shardCount; id++ {
-		wg.Add(1)
-		go func(shardID int) {
-			defer wg.Done()
-			shardPrefix := fmt.Sprintf("shard-%d", shardID)
-			dir := filepath.Join(dataDir, shardPrefix)
-			eng, err := engine.LoadAll(dir)
-			if err != nil {
-				once.Do(func() {
-					loadErr = fmt.Errorf("failed to load shard %d: %w", shardID, err)
-				})
-				return
-			}
-			engines[shardID] = eng
-		}(id)
-	}
-	wg.Wait()
-
-	if loadErr != nil {
-		ErrWriter(w, loadErr)
+	if err := sec.LoadAllShards(req.IndexName); err != nil {
+		ErrWriter(w, err)
 		return
 	}
-
-	first := engines[0]
-	controller := engine.NewSearchEngineController(
-		first.IndexFields,
-		first.Filters,
-		first.PageSize,
-		shardCount,
-	)
-	controller.Engines = engines
-	controller.SearchEngineCount = shardCount
-
-	ht.mu.Lock()
-	ht.controllers[req.IndexName] = controller
-	ht.mu.Unlock()
 
 	duration := time.Since(start)
 
@@ -566,7 +512,7 @@ func (ht *HTTP) LoadController(w http.ResponseWriter, r *http.Request) {
 		"status":     "success",
 		"statusCode": 200,
 		"indexName":  req.IndexName,
-		"shards":     shardCount,
+		"shards":     sec.SearchEngineCount,
 		"duration":   duration.String(),
 		"durationMs": duration.Milliseconds(),
 	}

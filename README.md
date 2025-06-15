@@ -30,7 +30,7 @@ go run .
 # Build the Docker image
 docker build -t searchengine:latest .
 
-# Run with a named volume at /data, saved index data will be under /persustent_date folder
+# Run the container
 docker run -d \
   -p 8080:8080 \
   -v search_data:/data \
@@ -196,13 +196,10 @@ Creates an *empty* index.
 ```http
 POST /add-to-index?indexName=products
 Content-Type: multipart/form-data
-
---boundary
 Content-Disposition: form-data; name="file"; filename="docs.json"
 Content-Type: application/json
 
 [ { "id":"1", "name":"foo", "tags":["a","b"], "year":2020 }, … ]
---boundary--
 ```
 
 Appends documents from a JSON array into an existing index.

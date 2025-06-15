@@ -53,6 +53,68 @@ func NewSearchEngineController(indexFields []string,
 	}
 }
 
+func (sec *SearchEngineController) LoadAllShards(indexName string) error {
+	baseDir := os.Getenv("INDEX_DATA_DIR")
+	if baseDir == "" {
+		baseDir = "./data"
+	}
+
+	dataDir := filepath.Join(baseDir, indexName)
+	shardCount := 0
+	for {
+		shardPrefix := fmt.Sprintf("shard-%d", shardCount)
+		dir := filepath.Join(dataDir, shardPrefix)
+		engineFile := fmt.Sprintf("%s.engine.gob", dir)
+		if _, err := os.Stat(engineFile); os.IsNotExist(err) {
+			break
+		}
+		shardCount++
+	}
+	if shardCount == 0 {
+		return fmt.Errorf("no shard files found with prefix %q", indexName)
+	}
+
+	engines := make([]*SearchEngine, shardCount)
+	var wg sync.WaitGroup
+	var loadErr error
+	var once sync.Once
+
+	for id := 0; id < shardCount; id++ {
+		wg.Add(1)
+		go func(shardID int) {
+			defer wg.Done()
+			shardPrefix := fmt.Sprintf("shard-%d", shardID)
+			dir := filepath.Join(dataDir, shardPrefix)
+			eng, err := LoadAll(dir, shardID)
+			if err != nil {
+				once.Do(func() {
+					loadErr = fmt.Errorf("failed to load shard %d: %w", shardID, err)
+				})
+				return
+			}
+			engines[shardID] = eng
+		}(id)
+	}
+	wg.Wait()
+
+	if loadErr != nil {
+		return loadErr
+	}
+
+	first := engines[0]
+	sec.Engines = engines
+	sec.Filters = first.Filters
+	sec.PageSize = first.PageSize
+	sec.SearchEngineCount = shardCount
+	sec.IndexFields = first.IndexFields
+
+	for _, engine := range sec.Engines {
+		sec.NumberOfTotalDocs += len(engine.Documents)
+	}
+
+	return nil
+}
+
 // SaveAllShards persists every shard to disk under /data/<indexName>/shard-<ID>/.
 // It creates the directory if needed, then calls each shard's SaveAll() to write its files.
 func (sec *SearchEngineController) SaveAllShards(indexName string) error {
@@ -157,6 +219,12 @@ func (sec *SearchEngineController) Search(query string, page int, filters map[st
 			go func(e *SearchEngine) {
 				defer wg.Done()
 				result := e.Search(query, page, filters, 1000)
+				fmt.Println("-----")
+				fmt.Println("SHARDID", se.ShardID)
+				for _, doc := range result.Docs {
+					fmt.Printf("ID:%s - Score:%d\n", doc.ID, doc.ScoreWeight)
+				}
+				fmt.Println("-----")
 				resultsChan <- result
 			}(se)
 		}
@@ -185,6 +253,9 @@ func (sec *SearchEngineController) Search(query string, page int, filters map[st
 		}
 	}
 
+	if res == nil {
+		return []Document{}
+	}
 	return res.Docs
 }
 
@@ -228,7 +299,12 @@ func CombineResults(resultsChan <-chan *SearchResult) *CombinedResponse {
 	case len(fuzzy) > 0:
 		returnResult = fuzzy
 	default:
-		return nil
+		resp := CombinedResponse{
+			Docs:            returnResult,
+			IsPrefix:        isPrefix,
+			MaxPrefixLength: maxPrefixLength,
+		}
+		return &resp
 	}
 
 	sort.Slice(returnResult, func(i, j int) bool {

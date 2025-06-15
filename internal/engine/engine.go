@@ -106,7 +106,6 @@ func (se *SearchEngine) SaveAll(path string) error {
 	payload := enginePayload{
 		Data:        se.Data,
 		Documents:   se.Documents,
-		ScoreIndex:  se.ScoreIndex,
 		FilterDocs:  se.FilterDocs,
 		IndexFields: se.IndexFields,
 		Filters:     se.Filters,
@@ -133,7 +132,7 @@ func (se *SearchEngine) SaveAll(path string) error {
 
 // LoadAll loads a SearchEngine from gob files with the given prefix.
 // Missing files are skipped, resulting in fresh defaults for those parts.
-func LoadAll(path string) (*SearchEngine, error) {
+func LoadAll(path string, shardID int) (*SearchEngine, error) {
 	se := &SearchEngine{
 		Data:        make(map[string]map[string]int),
 		Documents:   make(map[string]map[string]interface{}),
@@ -144,6 +143,7 @@ func LoadAll(path string) (*SearchEngine, error) {
 		IndexFields: nil,
 		Filters:     make(map[string]bool),
 		PageSize:    0,
+		ShardID:     shardID,
 	}
 
 	engineFile := path + ".engine.gob"
@@ -158,7 +158,7 @@ func LoadAll(path string) (*SearchEngine, error) {
 
 		se.Data = payload.Data
 		se.Documents = payload.Documents
-		se.ScoreIndex = payload.ScoreIndex
+		// se.ScoreIndex = payload.ScoreIndex
 		se.FilterDocs = payload.FilterDocs
 		se.IndexFields = payload.IndexFields
 		se.Filters = payload.Filters
@@ -166,6 +166,8 @@ func LoadAll(path string) (*SearchEngine, error) {
 		se.Keys = payload.Keys
 		se.Trie = payload.Trie
 	}
+
+	se.BuildScoreIndex()
 
 	return se, nil
 }
@@ -196,36 +198,35 @@ func (se *SearchEngine) Index(shardID int, docs []map[string]interface{}) {
 // - "exact": tokens that exactly match entries in the GlobalKeys store.
 // - "prefix": tokens that match prefixes found in the GlobalTrie.
 // - "fuzzy": tokens that approximately match entries in GlobalKeys within a given edit distance.
-func (se *SearchEngine) ProcessQuery(query string, prefixCount int) map[string][]string {
+func (se *SearchEngine) ProcessQuery(query string, prefixCount int) (map[string][]string, int) {
 	queryTokens := Tokenize(query)
-	if len(queryTokens) == 0 {
-		return nil
+	tokenCount := len(queryTokens)
+	if tokenCount == 0 {
+		return nil, 0
 	}
 
 	result := make(map[string][]string)
 
-	if len(queryTokens) == 1 {
-		for _, query := range queryTokens {
-			guessArr := se.Trie.SearchPrefix(query, prefixCount)
-			if guessArr != nil {
-				result["prefix"] = append(result["prefix"], guessArr...)
-			} else {
-				fuzzyMatch := false
-				for key := range se.Keys.GetData() {
-					if FuzzyMatch(key, query, 2) {
-						result["fuzzy"] = append(result["fuzzy"], key)
-						fuzzyMatch = true
-						break
-					}
+	if tokenCount == 1 {
+		guessArr := se.Trie.SearchPrefix(queryTokens[0], prefixCount)
+		if guessArr != nil {
+			result["prefix"] = append(result["prefix"], guessArr...)
+		} else {
+			fuzzyMatch := false
+			for key := range se.Keys.GetData() {
+				if FuzzyMatch(key, queryTokens[0], 2) {
+					result["fuzzy"] = append(result["fuzzy"], key)
+					fuzzyMatch = true
+					break
 				}
-				if !fuzzyMatch {
-					result["fuzzy"] = append(result["fuzzy"], query)
-				}
+			}
+			if !fuzzyMatch {
+				result["fuzzy"] = append(result["fuzzy"], queryTokens[0])
 			}
 		}
 	} else {
-		lastWord := queryTokens[len(queryTokens)-1]
-		result["exact"] = append(result["exact"], queryTokens[:len(queryTokens)-1]...)
+		lastWord := queryTokens[tokenCount-1]
+		result["exact"] = append(result["exact"], queryTokens[:tokenCount-1]...)
 		guessArr := se.Trie.SearchPrefix(lastWord, prefixCount)
 		if guessArr != nil {
 			result["prefix"] = append(result["prefix"], guessArr...)
@@ -244,7 +245,7 @@ func (se *SearchEngine) ProcessQuery(query string, prefixCount int) map[string][
 		}
 	}
 
-	return result
+	return result, tokenCount
 }
 
 // BuildScoreIndex constructs the ScoreIndex by sorting each term's postings by weight.
@@ -472,8 +473,16 @@ func (se *SearchEngine) SearchOneTermWithFilter(query string, filters map[string
 	return finalDocs[lastIndex:]
 }
 
-// searchAllWithoutFilter handles multi-term searches (exact + optional other terms) without filtering.
-func (se *SearchEngine) searchAllWithoutFilter(exactTerms, otherTerms []string, page int) []Document {
+// TODO: if we want to order by popularity,
+// we need to make multi term search by checking ALL terms given
+// in the input in the ScoreIndex and because it is ordered by final score, we can return
+// page count amount of documents if there is matching for all terms' ScoreIndex.
+
+// SearchMultipleTermsWithoutFilter is a public wrapper for multi-term searches without filters.
+func (se *SearchEngine) SearchMultipleTermsWithoutFilter(queriesMap map[string][]string, page int) []Document {
+	exactTerms := queriesMap["exact"]
+	otherTerms := append(queriesMap["prefix"], queriesMap["fuzzy"]...)
+
 	se.mu.RLock()
 	defer se.mu.RUnlock()
 	if len(exactTerms) == 0 {
@@ -498,11 +507,13 @@ func (se *SearchEngine) searchAllWithoutFilter(exactTerms, otherTerms []string, 
 			continue
 		}
 
+		otherTermIndex := 0
 		if len(otherTerms) > 0 {
 			foundOther := false
-			for _, term := range otherTerms {
+			for k, term := range otherTerms {
 				if _, ok := se.Data[term][doc.ID]; ok {
 					foundOther = true
+					otherTermIndex = k
 					break
 				}
 			}
@@ -518,8 +529,8 @@ func (se *SearchEngine) searchAllWithoutFilter(exactTerms, otherTerms []string, 
 			totalScore += weight
 		}
 
-		for _, term := range otherTerms {
-			weight := se.Data[term][doc.ID]
+		for i := otherTermIndex; i < len(otherTerms); i++ {
+			weight := se.Data[otherTerms[i]][doc.ID]
 			totalScore += weight
 		}
 
@@ -543,8 +554,13 @@ func (se *SearchEngine) searchAllWithoutFilter(exactTerms, otherTerms []string, 
 	return finalDocs[startIndex:stopIndex]
 }
 
-// searchAllWithFilter handles multi-term searches with filtering applied.
-func (se *SearchEngine) searchAllWithFilter(exactTerms, otherTerms []string, filteredDocs map[string]bool, page int) []Document {
+// SearchMultipleTermsWithFilter is a public wrapper for multi-term searches with filters.
+func (se *SearchEngine) SearchMultipleTermsWithFilter(queriesMap map[string][]string, filters map[string][]interface{}, page int) []Document {
+	filteredDocs := se.ApplyFilter(filters)
+
+	exactTerms := queriesMap["exact"]
+	otherTerms := append(queriesMap["prefix"], queriesMap["fuzzy"]...)
+
 	se.mu.RLock()
 	defer se.mu.RUnlock()
 	if len(exactTerms) == 0 {
@@ -572,11 +588,13 @@ func (se *SearchEngine) searchAllWithFilter(exactTerms, otherTerms []string, fil
 			continue
 		}
 
+		otherTermIndex := 0
 		if len(otherTerms) > 0 {
 			foundOther := false
-			for _, term := range otherTerms {
+			for k, term := range otherTerms {
 				if _, ok := se.Data[term][doc.ID]; ok {
 					foundOther = true
+					otherTermIndex = k
 					break
 				}
 			}
@@ -592,8 +610,8 @@ func (se *SearchEngine) searchAllWithFilter(exactTerms, otherTerms []string, fil
 			totalScore += weight
 		}
 
-		for _, term := range otherTerms {
-			weight := se.Data[term][doc.ID]
+		for i := otherTermIndex; i < len(otherTerms); i++ {
+			weight := se.Data[otherTerms[i]][doc.ID]
 			totalScore += weight
 		}
 
@@ -616,46 +634,14 @@ func (se *SearchEngine) searchAllWithFilter(exactTerms, otherTerms []string, fil
 	return finalDocs[startIndex:stopIndex]
 }
 
-// TODO: if we want to order by popularity,
-// we need to make multi term search by checking ALL terms given
-// in the input in the ScoreIndex and because it is ordered by final score, we can return
-// page count amount of documents if there is matching for all terms' ScoreIndex.
-
-// SearchMultipleTermsWithoutFilter is a public wrapper for multi-term searches without filters.
-func (se *SearchEngine) SearchMultipleTermsWithoutFilter(queriesMap map[string][]string, page int) []Document {
-	result := se.searchAllWithoutFilter(queriesMap["exact"], append(queriesMap["prefix"], queriesMap["fuzzy"]...), page)
-	return result
-}
-
-// SearchMultipleTermsWithFilter is a public wrapper for multi-term searches with filters.
-func (se *SearchEngine) SearchMultipleTermsWithFilter(queriesMap map[string][]string, filters map[string][]interface{}, page int) []Document {
-	filteredDocs := se.ApplyFilter(filters)
-	result := se.searchAllWithFilter(queriesMap["exact"], append(queriesMap["prefix"], queriesMap["fuzzy"]...), filteredDocs, page)
-	return result
-}
-
-func (se *SearchEngine) searchWithTokens(queryTokens map[string][]string, page int, filters map[string][]interface{}) *SearchResult {
+func (se *SearchEngine) searchWithTokens(queryTokens map[string][]string, page int, filters map[string][]interface{}, tokenCount int) *SearchResult {
 	if len(filters) == 0 {
-		if len(queryTokens["exact"]) == 1 &&
-			len(queryTokens["prefix"]) == 0 &&
-			len(queryTokens["fuzzy"]) == 0 {
-			resultDocs := se.SearchOneTermWithoutFilter(queryTokens["exact"][0], page)
-			return &SearchResult{
-				Docs:        resultDocs,
-				IsMultiTerm: false,
-				IsFuzzy:     false,
-				IsPrefix:    false,
-				IsExact:     true,
-			}
-		}
-
-		if len(queryTokens["exact"]) == 0 {
+		if tokenCount == 1 {
 			if len(queryTokens["prefix"]) > 0 {
 				var finalDocs []Document
 				for _, query := range queryTokens["prefix"] {
 					finalDocs = append(finalDocs, se.SearchOneTermWithoutFilter(query, page)...)
 				}
-				// resultDocs := se.SearchOneTermWithoutFilter(queryTokens["prefix"][0], page)
 				return &SearchResult{
 					Docs:        finalDocs,
 					IsMultiTerm: false,
@@ -674,35 +660,25 @@ func (se *SearchEngine) searchWithTokens(queryTokens map[string][]string, page i
 					IsExact:     false,
 				}
 			}
-		}
-
-		resultDocs := se.SearchMultipleTermsWithoutFilter(queryTokens, page)
-		return &SearchResult{
-			Docs:        resultDocs,
-			IsMultiTerm: true,
-			IsFuzzy:     false,
-			IsPrefix:    false,
-			IsExact:     true,
-		}
-	} else {
-		if len(queryTokens["exact"]) == 1 &&
-			len(queryTokens["prefix"]) == 0 &&
-			len(queryTokens["fuzzy"]) == 0 {
-			resultDocs := se.SearchOneTermWithFilter(queryTokens["exact"][0], filters, page)
+		} else {
+			resultDocs := se.SearchMultipleTermsWithoutFilter(queryTokens, page)
 			return &SearchResult{
 				Docs:        resultDocs,
-				IsMultiTerm: false,
+				IsMultiTerm: true,
 				IsFuzzy:     false,
 				IsPrefix:    false,
 				IsExact:     true,
 			}
 		}
-
-		if len(queryTokens["exact"]) == 0 {
+	} else {
+		if tokenCount == 1 {
 			if len(queryTokens["prefix"]) > 0 {
-				resultDocs := se.SearchOneTermWithFilter(queryTokens["prefix"][0], filters, page)
+				var finalDocs []Document
+				for _, query := range queryTokens["prefix"] {
+					finalDocs = append(finalDocs, se.SearchOneTermWithFilter(query, filters, page)...)
+				}
 				return &SearchResult{
-					Docs:        resultDocs,
+					Docs:        finalDocs,
 					IsMultiTerm: false,
 					IsFuzzy:     false,
 					IsPrefix:    true,
@@ -719,38 +695,41 @@ func (se *SearchEngine) searchWithTokens(queryTokens map[string][]string, page i
 					IsExact:     false,
 				}
 			}
-		}
-
-		resultDocs := se.SearchMultipleTermsWithFilter(queryTokens, filters, page)
-		return &SearchResult{
-			Docs:        resultDocs,
-			IsMultiTerm: true,
-			IsFuzzy:     false,
-			IsPrefix:    false,
-			IsExact:     true,
+		} else {
+			resultDocs := se.SearchMultipleTermsWithFilter(queryTokens, filters, page)
+			return &SearchResult{
+				Docs:        resultDocs,
+				IsMultiTerm: true,
+				IsFuzzy:     false,
+				IsPrefix:    false,
+				IsExact:     true,
+			}
 		}
 	}
+
+	return nil
 }
 
 // Search executes a full query (possibly multi-term) with optional filters,
 // selecting the correct search path (exact, prefix, fuzzy, or multi-term).
 func (se *SearchEngine) Search(query string, page int, filters map[string][]interface{}, prefixCount int) *SearchResult {
-	queryTokens := se.ProcessQuery(query, prefixCount)
-	if len(queryTokens["prefix"]) <= 5 {
-		fmt.Println("ShardID:", se.ShardID, "ProcessQuery:", queryTokens)
+	queryTokensMap, tokenCount := se.ProcessQuery(query, prefixCount)
+
+	if len(queryTokensMap["prefix"]) <= 5 {
+		fmt.Println("ShardID:", se.ShardID, "ProcessQuery:", queryTokensMap)
 	} else {
 		fmt.Println("ShardID:", se.ShardID, "ProcessQuery Lengths:",
-			len(queryTokens["exact"]),
-			len(queryTokens["prefix"]),
-			len(queryTokens["fuzzy"]))
+			len(queryTokensMap["exact"]),
+			len(queryTokensMap["prefix"]),
+			len(queryTokensMap["fuzzy"]))
 	}
 
-	if queryTokens == nil {
+	if queryTokensMap == nil {
 		return nil
 	}
 
-	result := se.searchWithTokens(queryTokens, page, filters)
-	result.PrefixLength = len(queryTokens["prefix"])
+	result := se.searchWithTokens(queryTokensMap, page, filters, tokenCount)
+	result.PrefixLength = len(queryTokensMap["prefix"])
 	return result
 }
 
@@ -774,6 +753,7 @@ func (se *SearchEngine) addScoreIndex(tokens []string, docID string) {
 			se.ScoreIndex[token][index] = Document{
 				ID:          docID,
 				ScoreWeight: score,
+				Data:        se.Documents[docID],
 			}
 			se.mu.Unlock()
 		} else {
@@ -781,6 +761,7 @@ func (se *SearchEngine) addScoreIndex(tokens []string, docID string) {
 			se.ScoreIndex[token] = []Document{{
 				ID:          docID,
 				ScoreWeight: score,
+				Data:        se.Documents[docID],
 			}}
 			se.mu.Unlock()
 		}
@@ -792,6 +773,13 @@ func (se *SearchEngine) addDocument(doc map[string]interface{}) {
 	docID := fmt.Sprintf("%v", doc["id"])
 
 	se.BuildDocumentIndex([]map[string]interface{}{doc})
+
+	se.mu.Lock()
+	se.Documents[docID] = make(map[string]interface{})
+	for k, v := range doc {
+		se.Documents[docID][k] = v
+	}
+	se.mu.Unlock()
 
 	for _, weightField := range se.IndexFields {
 		if value, exists := doc[weightField]; exists {
@@ -814,13 +802,6 @@ func (se *SearchEngine) addDocument(doc map[string]interface{}) {
 			}
 		}
 	}
-
-	se.mu.Lock()
-	se.Documents[docID] = make(map[string]interface{})
-	for k, v := range doc {
-		se.Documents[docID][k] = v
-	}
-	se.mu.Unlock()
 }
 
 // removeDocumentByID removes a document from the inverted index and the document list.
