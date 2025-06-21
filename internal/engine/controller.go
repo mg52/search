@@ -178,6 +178,7 @@ func (sec *SearchEngineController) Search(query string, page int, filters map[st
 		wg.Add(1)
 		go func(e *SearchEngine) {
 			defer wg.Done()
+			// TODO: magic number, make it configurative
 			result := e.Search(query, page, filters, 5)
 			resultsChan <- result
 		}(se)
@@ -191,11 +192,12 @@ func (sec *SearchEngineController) Search(query string, page int, filters map[st
 	totalDocs := sec.NumberOfTotalDocs
 	sec.mu.RUnlock()
 
-	// If the entire index is small (fewer than 10,000 documents), it’s unlikely
+	// If the entire index is small (fewer than 1,000 documents), it’s unlikely
 	// that any search will be missing results due to prefix limitations.
 	// In that case, we can return whatever we found immediately without
 	// attempting longer prefix searches.
-	if totalDocs < 10_000 {
+	// TODO: magic number, make it configurative
+	if totalDocs < 1_000 {
 		if res != nil {
 			return res.Docs
 		}
@@ -203,13 +205,14 @@ func (sec *SearchEngineController) Search(query string, page int, filters map[st
 	}
 
 	// In the initial search, we used a maximum prefix length of 5.
-	// If the merged results are fewer than 5 documents AND they were obtained
+	// If the merged results are fewer than 4 documents AND they were obtained
 	// using that prefix length (IsPrefix == true and MaxPrefixLength == 5),
 	// it means we might have missed matches that require a longer prefix.
 	// Therefore, we perform a second search with a larger prefix length (1000).
 	// If that still yields too few results (and MaxPrefixLength == 1000),
 	// we fall back to an even larger prefix length (8000) in a third attempt.
-	if res == nil || (len(res.Docs) < 5 && res.IsPrefix && res.MaxPrefixLength == 5) {
+	// TODO: magic number, make it configurative
+	if res == nil || (len(res.Docs) < 4 && res.IsPrefix && res.MaxPrefixLength == 5) {
 		fmt.Println("SECOND SEARCH")
 		resultsChan := make(chan *SearchResult, sec.SearchEngineCount)
 		var wg sync.WaitGroup
@@ -218,6 +221,7 @@ func (sec *SearchEngineController) Search(query string, page int, filters map[st
 			wg.Add(1)
 			go func(e *SearchEngine) {
 				defer wg.Done()
+				// TODO: magic number, make it configurative
 				result := e.Search(query, page, filters, 1000)
 				fmt.Println("-----")
 				fmt.Println("SHARDID", se.ShardID)
@@ -233,7 +237,8 @@ func (sec *SearchEngineController) Search(query string, page int, filters map[st
 
 		res = CombineResults(resultsChan)
 
-		if res == nil || (len(res.Docs) < 5 && res.MaxPrefixLength == 1000) {
+		// TODO: magic number, make it configurative
+		if res == nil || (len(res.Docs) < 4 && res.MaxPrefixLength == 1000) {
 			fmt.Println("THIRD SEARCH")
 			resultsChan := make(chan *SearchResult, sec.SearchEngineCount)
 			var wg sync.WaitGroup
@@ -242,6 +247,7 @@ func (sec *SearchEngineController) Search(query string, page int, filters map[st
 				wg.Add(1)
 				go func(e *SearchEngine) {
 					defer wg.Done()
+					// TODO: magic number, make it configurative
 					result := e.Search(query, page, filters, 8000)
 					resultsChan <- result
 				}(se)
@@ -263,6 +269,7 @@ func (sec *SearchEngineController) Search(query string, page int, filters map[st
 // It collects docs into the first non-empty category, sorts by ScoreWeight desc, and returns.
 func CombineResults(resultsChan <-chan *SearchResult) *CombinedResponse {
 	var multi, exact, prefix, fuzzy []Document
+
 	isPrefix := false
 	maxPrefixLength := 0
 	for res := range resultsChan {

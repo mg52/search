@@ -2,9 +2,12 @@ package engine
 
 import (
 	_ "embed"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"sync"
 	"testing"
 
@@ -14,6 +17,9 @@ import (
 
 //go:embed testdata/products.json
 var testProductsJSON []byte
+
+//go:embed testdata/products2.json
+var testProducts2JSON []byte
 
 func setupEngineWithKeys(keys []string) *SearchEngine {
 	// Initialize engine
@@ -48,6 +54,7 @@ func TestProcessQuery(t *testing.T) {
 			query: "foo",
 			expected: map[string][]string{
 				"prefix": {"foo"},
+				"raw":    {"foo"},
 			},
 		},
 		{
@@ -56,6 +63,7 @@ func TestProcessQuery(t *testing.T) {
 			query: "ap",
 			expected: map[string][]string{
 				"prefix": {"apple", "apricot"},
+				"raw":    {"ap"},
 			},
 		},
 		{
@@ -64,6 +72,7 @@ func TestProcessQuery(t *testing.T) {
 			query: "kiten", // one deletion away
 			expected: map[string][]string{
 				"fuzzy": {"kitten"},
+				"raw":   {"kiten"},
 			},
 		},
 		{
@@ -72,6 +81,7 @@ func TestProcessQuery(t *testing.T) {
 			query: "xyz",
 			expected: map[string][]string{
 				"fuzzy": {"xyz"},
+				"raw":   {"xyz"},
 			},
 		},
 		{
@@ -79,8 +89,39 @@ func TestProcessQuery(t *testing.T) {
 			keys:  []string{"apple", "apricot", "foo", "kite"},
 			query: "ap foo ki",
 			expected: map[string][]string{
-				"exact":  {"ap", "foo"},
+				"exact":  {"apple", "foo"},
 				"prefix": {"kite"},
+				"raw":    {"ap", "foo", "ki"},
+			},
+		},
+		{
+			name:  "multiple tokens mixed types 2",
+			keys:  []string{"apple", "apricot", "foo", "kite", "pepper"},
+			query: "peppar f",
+			expected: map[string][]string{
+				"exact":  {"pepper"},
+				"prefix": {"foo"},
+				"raw":    {"peppar", "f"},
+			},
+		},
+		{
+			name:  "multiple tokens mixed types 3",
+			keys:  []string{"apple", "apricot", "foo", "kite", "pepper", "fine"},
+			query: "peppar f",
+			expected: map[string][]string{
+				"exact":  {"pepper"},
+				"prefix": {"foo", "fine"},
+				"raw":    {"peppar", "f"},
+			},
+		},
+		{
+			name:  "multiple tokens mixed types 4",
+			keys:  []string{"apple", "apricot", "foo", "kite", "pepper", "fine"},
+			query: "peppar fop",
+			expected: map[string][]string{
+				"exact": {"pepper"},
+				"fuzzy": {"foo"},
+				"raw":   {"peppar", "fop"},
 			},
 		},
 	}
@@ -368,20 +409,27 @@ func TestSearchOneTermWithFilter(t *testing.T) {
 	}
 }
 
-func TestSearchMultipleTermsWithoutFilter(t *testing.T) {
+func TestSearchMultipleTermsWithoutFilter_WithoutIndexing(t *testing.T) {
 	engine := buildTestEngine(t)
 	// multi-term: exact matches ["apple","date"] → only doc3 has date but not apple; doc1 has apple but not date → none
 	queries := map[string][]string{
-		"exact":  {"apple", "date"},
-		"prefix": nil,
+		"exact":  {"apple"},
+		"prefix": {"date"},
 		"fuzzy":  nil,
+		"raw":    {"apple", "date"},
 	}
 	res := engine.SearchMultipleTermsWithoutFilter(queries, 0)
 	if len(res) != 0 {
 		t.Errorf("expected no docs, got %v", res)
 	}
 	// two terms ["banana","cherry"] → doc2 matches both
-	queries["exact"] = []string{"banana", "cherry"}
+	// queries["exact"] = []string{"banana", "cherry"}
+	queries = map[string][]string{
+		"exact":  {"banana"},
+		"prefix": {"cherry"},
+		"fuzzy":  nil,
+		"raw":    {"banana", "cherry"},
+	}
 	res = engine.SearchMultipleTermsWithoutFilter(queries, 0)
 	if len(res) != 1 || res[0].ID != "2" {
 		t.Errorf("expected doc2, got %v", res)
@@ -391,7 +439,7 @@ func TestSearchMultipleTermsWithoutFilter(t *testing.T) {
 func TestSearchMultipleTermsWithFilter(t *testing.T) {
 	engine := buildTestEngine(t)
 	// multi-term with filter year=2020: exact ["apple","banana"] only doc1
-	queries := map[string][]string{"exact": {"apple", "banana"}, "prefix": nil, "fuzzy": nil}
+	queries := map[string][]string{"exact": {"apple"}, "prefix": {"banana"}, "fuzzy": nil, "raw": {"apple", "banana"}}
 	res := engine.SearchMultipleTermsWithFilter(queries, map[string][]interface{}{"year": {2020}}, 0)
 	if len(res) != 1 || res[0].ID != "1" {
 		t.Errorf("expected doc1, got %v", res)
@@ -643,150 +691,489 @@ func TestApplyFilter_MissingValuesInMulti(t *testing.T) {
 	}
 }
 
-// newTestEngineForMultipleTerm builds a SearchEngine prepopulated for SearchMultipleTermsWithFilter tests
-func newTestEngineForMultipleTerm(
-	pageSize int,
-	scoreIndex map[string][]Document,
-	weights map[string]map[string]int,
-	docs map[string]map[string]interface{},
-	filterDocs map[string]map[string]bool,
-) *SearchEngine {
+// newTestEngine constructs a bare SearchEngine suitable for unit tests.
+func newTestEngineForMultipleTerm(pageSize int) *SearchEngine {
 	return &SearchEngine{
-		mu:         sync.RWMutex{},
+		ScoreIndex: make(map[string][]Document),
+		Data:       make(map[string]map[string]int),
+		DocData:    make(map[string]map[string]bool),
+		Documents:  make(map[string]map[string]interface{}),
+		FilterDocs: make(map[string]map[string]bool),
 		PageSize:   pageSize,
-		ScoreIndex: scoreIndex,
-		Data:       weights,
-		Documents:  docs,
-		FilterDocs: filterDocs,
 	}
 }
 
-func TestSearchMultipleTermsWithFilter_NoExactTerms(t *testing.T) {
-	se := newTestEngineForMultipleTerm(10, nil, nil, nil, nil)
-	queries := map[string][]string{"exact": {}, "prefix": {}, "fuzzy": {}}
-	res := se.SearchMultipleTermsWithFilter(queries, nil, 0)
-	if res != nil {
-		t.Errorf("expected nil when no exact terms, got %v", res)
+func TestSearchMultipleTermsWithoutFilter(t *testing.T) {
+	e := newTestEngineForMultipleTerm(10)
+
+	// two docs for term "foo"
+	e.ScoreIndex["foo"] = []Document{
+		{ID: "d1", Data: map[string]interface{}{"title": "Doc1"}, ScoreWeight: 1},
+		{ID: "d2", Data: map[string]interface{}{"title": "Doc2"}, ScoreWeight: 2},
+	}
+	e.Documents["d1"] = map[string]interface{}{"title": "Doc1"}
+	e.Documents["d2"] = map[string]interface{}{"title": "Doc2"}
+
+	// prepare for prefix branch: raw[1] length == 2
+	e.DocData["d1"] = map[string]bool{"foobar": true}
+	e.Data["foobar"] = map[string]int{"d1": 3}
+	e.DocData["d2"] = map[string]bool{"foobaz": true}
+	e.Data["foobaz"] = map[string]int{"d2": 4}
+
+	t.Run("prefix branch", func(t *testing.T) {
+		queries := map[string][]string{
+			"raw":   {"foo", "fo"},
+			"exact": {"foo"},
+		}
+		res := e.SearchMultipleTermsWithoutFilter(queries, 0)
+		if len(res) != 2 {
+			t.Fatalf("expected 2 docs, got %d", len(res))
+		}
+		wantScores := map[string]int{"d1": 1 + 3, "d2": 2 + 4}
+		for _, doc := range res {
+			if got, want := doc.ScoreWeight, wantScores[doc.ID]; got != want {
+				t.Errorf("doc %s: score %d; want %d", doc.ID, got, want)
+			}
+		}
+	})
+
+	// prepare for non-prefix branch: raw[1] length > 2
+	t.Run("no-prefix branch", func(t *testing.T) {
+		// Only d1 has the exact "foobar" term
+		queries := map[string][]string{
+			"raw":    {"foo", "foobar"},
+			"exact":  {"foo"},
+			"prefix": {"foobar"},
+			"fuzzy":  nil,
+		}
+		res := e.SearchMultipleTermsWithoutFilter(queries, 0)
+		if len(res) != 1 || res[0].ID != "d1" {
+			t.Fatalf("expected only [d1], got %v", res)
+		}
+		if got, want := res[0].ScoreWeight, 1+3; got != want {
+			t.Errorf("d1 score %d; want %d", got, want)
+		}
+	})
+}
+
+func TestSearchDoubleTermsWithPrefixWithoutFilter_Paging(t *testing.T) {
+	e := newTestEngineForMultipleTerm(1)
+	e.ScoreIndex["foo"] = []Document{
+		{ID: "d1", Data: nil, ScoreWeight: 1},
+		{ID: "d2", Data: nil, ScoreWeight: 2},
+	}
+	e.Documents["d1"] = map[string]interface{}{"title": "D1"}
+	e.Documents["d2"] = map[string]interface{}{"title": "D2"}
+	// both docs have the term "bar" to match prefix "ba"
+	e.DocData["d1"] = map[string]bool{"bar": true}
+	e.DocData["d2"] = map[string]bool{"bar": true}
+	e.Data["bar"] = map[string]int{"d1": 5, "d2": 6}
+
+	queries := map[string][]string{
+		"raw":   {"foo", "ba"},
+		"exact": {"foo"},
+	}
+	// page 0 → first hit (d1)
+	if res := e.SearchDoubleTermsWithPrefixWithoutFilter(queries, 0); len(res) != 1 || res[0].ID != "d1" {
+		t.Errorf("page0 expected [d1], got %v", res)
+	}
+	// page 1 → second hit (d2)
+	if res := e.SearchDoubleTermsWithPrefixWithoutFilter(queries, 1); len(res) != 1 || res[0].ID != "d2" {
+		t.Errorf("page1 expected [d2], got %v", res)
+	}
+	// page 2 → out of range
+	if res := e.SearchDoubleTermsWithPrefixWithoutFilter(queries, 2); len(res) != 0 {
+		t.Errorf("page2 expected nil, got %v", res)
 	}
 }
 
-func TestSearchMultipleTermsWithFilter_SingleExact_NoOthers(t *testing.T) {
-	// Setup single exact term, two docs, page 0
-	scoreIdx := map[string][]Document{
-		"foo": {{ID: "d1", ScoreWeight: 5}, {ID: "d2", ScoreWeight: 3}},
+func TestSearchDoubleTermsWithoutFilter(t *testing.T) {
+	e := newTestEngineForMultipleTerm(10)
+	e.ScoreIndex["foo"] = []Document{
+		{ID: "d1", Data: nil, ScoreWeight: 2},
+		{ID: "d2", Data: nil, ScoreWeight: 3},
 	}
-	weights := map[string]map[string]int{}
-	docs := map[string]map[string]interface{}{
-		"d1": {"value": "A"},
-		"d2": {"value": "B"},
+	// only d2 has term "baz"
+	e.Data["baz"] = map[string]int{"d2": 7}
+	e.DocData["d2"] = map[string]bool{"foo": true, "baz": true}
+
+	queries := map[string][]string{
+		"raw":    {"foo", "baz"},
+		"exact":  {"foo"},
+		"prefix": nil,
+		"fuzzy":  {"baz"},
 	}
-	filterDocs := map[string]map[string]bool{"type:all": {"d1": true, "d2": true}}
-	se := newTestEngineForMultipleTerm(
-		2,
-		scoreIdx,
-		weights,
-		docs,
-		filterDocs,
+	res := e.SearchDoubleTermsWithoutFilter(queries, 0)
+	if len(res) != 1 || res[0].ID != "d2" {
+		t.Fatalf("expected [d2], got %v", res)
+	}
+	if got, want := res[0].ScoreWeight, 3+7; got != want {
+		t.Errorf("score = %d; want %d", got, want)
+	}
+}
+
+func TestSearchMoreThanDoubleTermsWithPrefixWithoutFilter(t *testing.T) {
+	e := newTestEngineForMultipleTerm(10)
+	e.ScoreIndex["a"] = []Document{
+		{ID: "d1", Data: nil, ScoreWeight: 1},
+		{ID: "d2", Data: nil, ScoreWeight: 2},
+	}
+	e.Documents["d1"] = map[string]interface{}{"title": "D1"}
+	e.Documents["d2"] = map[string]interface{}{"title": "D2"}
+	// both docs have exact "b"
+	e.Data["b"] = map[string]int{"d1": 3, "d2": 4}
+	// doc-specific terms for prefix "c"
+	e.DocData["d1"] = map[string]bool{"cx": true}
+	e.Data["cx"] = map[string]int{"d1": 5}
+	e.DocData["d2"] = map[string]bool{"cy": true}
+	e.Data["cy"] = map[string]int{"d2": 6}
+
+	queries := map[string][]string{
+		"raw":   {"a", "b", "c"},
+		"exact": {"a", "b"},
+	}
+	res := e.SearchMoreThanDoubleTermsWithPrefixWithoutFilter(queries, 0)
+	if len(res) != 2 {
+		t.Fatalf("expected 2 docs, got %d", len(res))
+	}
+	wantScores := map[string]int{"d1": 1 + 3 + 5, "d2": 2 + 4 + 6}
+	for _, d := range res {
+		if got, want := d.ScoreWeight, wantScores[d.ID]; got != want {
+			t.Errorf("%s score = %d; want %d", d.ID, got, want)
+		}
+	}
+}
+
+func TestSearchMoreThanDoubleTermsWithoutFilter(t *testing.T) {
+	e := newTestEngineForMultipleTerm(10)
+	e.ScoreIndex["a"] = []Document{
+		{ID: "d1", Data: nil, ScoreWeight: 1},
+		{ID: "d2", Data: nil, ScoreWeight: 2},
+	}
+	e.Documents["d1"] = map[string]interface{}{"title": "D1"}
+	e.Documents["d2"] = map[string]interface{}{"title": "D2"}
+	// exact "b" weights
+	e.Data["b"] = map[string]int{"d1": 3, "d2": 4}
+	// prefix/fuzzy "d" present only in d2
+	e.Data["d"] = map[string]int{"d2": 5}
+	e.DocData["d2"] = map[string]bool{"d": true}
+
+	queries := map[string][]string{
+		"raw":    {"a", "b", "d"},
+		"exact":  {"a", "b"},
+		"prefix": {"d"},
+		"fuzzy":  nil,
+	}
+	res := e.SearchMoreThanDoubleTermsWithoutFilter(queries, 0)
+	if len(res) != 1 || res[0].ID != "d2" {
+		t.Fatalf("expected [d2], got %v", res)
+	}
+	// Score: base(2) + exact-b(4) + other-d(5) = 11
+	if got, want := res[0].ScoreWeight, 11; got != want {
+		t.Errorf("score = %d; want %d", got, want)
+	}
+}
+
+// sanity-check that slices are stable and slicing logic works
+func TestPagingEdgeCases(t *testing.T) {
+	e := newTestEngineForMultipleTerm(2)
+	// make 5 docs all matching
+	var docs []Document
+	for i := 1; i <= 5; i++ {
+		id := fmt.Sprintf("d%d", i)
+		docs = append(docs, Document{ID: id, Data: nil, ScoreWeight: i})
+		e.Documents[id] = map[string]interface{}{"title": id}
+		e.DocData[id] = map[string]bool{"term": true}
+		e.Data["term"] = map[string]int{id: i}
+	}
+	e.ScoreIndex["term"] = docs
+
+	queries := map[string][]string{
+		"raw":   {"term", "te"},
+		"exact": {"term"},
+	}
+
+	// page 0 -> docs[0:2]
+	res0 := e.SearchDoubleTermsWithPrefixWithoutFilter(queries, 0)
+	if !reflect.DeepEqual(getIDs(res0), []string{"d1", "d2"}) {
+		t.Errorf("page0 IDs = %v; want [d1 d2]", getIDs(res0))
+	}
+	// page 1 -> docs[2:4]
+	res1 := e.SearchDoubleTermsWithPrefixWithoutFilter(queries, 1)
+	if !reflect.DeepEqual(getIDs(res1), []string{"d3", "d4"}) {
+		t.Errorf("page1 IDs = %v; want [d3 d4]", getIDs(res1))
+	}
+	// page 2 -> docs[4:5]
+	res2 := e.SearchDoubleTermsWithPrefixWithoutFilter(queries, 2)
+	if !reflect.DeepEqual(getIDs(res2), []string{"d5"}) {
+		t.Errorf("page2 IDs = %v; want [d5]", getIDs(res2))
+	}
+	// page 3 -> out of range
+	if res3 := e.SearchDoubleTermsWithPrefixWithoutFilter(queries, 3); res3 != nil {
+		t.Errorf("page3 expected nil, got %v", res3)
+	}
+}
+
+func TestSearchMultipleTermsWithFilterDetail(t *testing.T) {
+	e := newTestEngineForMultipleTerm(10)
+	// only include d1 via filter
+	e.FilterDocs["id:d1"] = map[string]bool{"d1": true}
+
+	// setup documents
+	e.ScoreIndex["foo"] = []Document{
+		{ID: "d1", Data: nil, ScoreWeight: 1},
+		{ID: "d2", Data: nil, ScoreWeight: 2},
+	}
+	e.Documents["d1"] = map[string]interface{}{"title": "Doc1"}
+	e.Documents["d2"] = map[string]interface{}{"title": "Doc2"}
+
+	// prefix data
+	e.DocData["d1"] = map[string]bool{"foobar": true}
+	e.Data["foobar"] = map[string]int{"d1": 3}
+	e.DocData["d2"] = map[string]bool{"foobaz": true}
+	e.Data["foobaz"] = map[string]int{"d2": 4}
+
+	filters := map[string][]interface{}{"id": {"d1"}}
+
+	t.Run("prefix branch", func(t *testing.T) {
+		queries := map[string][]string{
+			"raw":   {"foo", "fo"},
+			"exact": {"foo"},
+		}
+		res := e.SearchMultipleTermsWithFilter(queries, filters, 0)
+		if len(res) != 1 || res[0].ID != "d1" {
+			t.Fatalf("expected only d1, got %v", res)
+		}
+		if res[0].ScoreWeight != 1+3 {
+			t.Errorf("score = %d; want %d", res[0].ScoreWeight, 4)
+		}
+	})
+
+	t.Run("no-prefix branch", func(t *testing.T) {
+		queries := map[string][]string{
+			"raw":    {"foo", "foobar"},
+			"exact":  {"foo"},
+			"prefix": {"foobar"},
+			"fuzzy":  nil,
+		}
+		res := e.SearchMultipleTermsWithFilter(queries, filters, 0)
+		if len(res) != 1 || res[0].ID != "d1" {
+			t.Fatalf("expected only d1, got %v", res)
+		}
+	})
+}
+
+func TestSearchDoubleTermsWithPrefixWithFilter(t *testing.T) {
+	e := newTestEngineForMultipleTerm(5)
+	e.FilterDocs["id:d2"] = map[string]bool{"d2": true}
+
+	e.ScoreIndex["foo"] = []Document{
+		{ID: "d1", Data: nil, ScoreWeight: 1},
+		{ID: "d2", Data: nil, ScoreWeight: 2},
+	}
+	e.Documents["d1"] = map[string]interface{}{"": nil}
+	e.Documents["d2"] = map[string]interface{}{"": nil}
+	e.DocData["d1"] = map[string]bool{"bar": true}
+	e.Data["bar"] = map[string]int{"d1": 5}
+	e.DocData["d2"] = map[string]bool{"bar": true}
+	e.Data["bar"]["d2"] = 6
+
+	filters := map[string][]interface{}{"id": {"d2"}}
+	queries := map[string][]string{"raw": {"foo", "ba"}, "exact": {"foo"}}
+
+	res := e.SearchDoubleTermsWithPrefixWithFilter(queries, filters, 0)
+	if len(res) != 1 || res[0].ID != "d2" {
+		t.Fatalf("expected only d2, got %v", res)
+	}
+	if res[0].ScoreWeight != 2+6 {
+		t.Errorf("score = %d; want %d", res[0].ScoreWeight, 8)
+	}
+}
+
+func TestSearchDoubleTermsWithFilter(t *testing.T) {
+	e := newTestEngineForMultipleTerm(5)
+	e.FilterDocs["id:d1"] = map[string]bool{"d1": true}
+
+	e.ScoreIndex["foo"] = []Document{{ID: "d1", Data: nil, ScoreWeight: 3}}
+	e.Documents["d1"] = map[string]interface{}{"": nil}
+	e.Data["baz"] = map[string]int{"d1": 7}
+
+	filters := map[string][]interface{}{"id": {"d1"}}
+	queries := map[string][]string{
+		"raw":    {"foo", "baz"},
+		"exact":  {"foo"},
+		"prefix": nil,
+		"fuzzy":  {"baz"},
+	}
+	res := e.SearchDoubleTermsWithFilter(queries, filters, 0)
+	if len(res) != 1 || res[0].ID != "d1" {
+		t.Fatalf("expected d1, got %v", res)
+	}
+	if res[0].ScoreWeight != 3+7 {
+		t.Errorf("score = %d; want %d", res[0].ScoreWeight, 10)
+	}
+}
+
+func TestSearchMoreThanDoubleTermsWithPrefixWithFilter(t *testing.T) {
+	e := newTestEngineForMultipleTerm(5)
+	e.FilterDocs["id:d2"] = map[string]bool{"d2": true}
+
+	e.ScoreIndex["a"] = []Document{{ID: "d1", Data: nil, ScoreWeight: 1}, {ID: "d2", Data: nil, ScoreWeight: 2}}
+	e.Documents["d1"] = map[string]interface{}{"": nil}
+	e.Documents["d2"] = map[string]interface{}{"": nil}
+	e.Data["b"] = map[string]int{"d1": 3, "d2": 4}
+	e.DocData["d1"] = map[string]bool{"cx": true}
+	e.Data["cx"] = map[string]int{"d1": 5}
+	e.DocData["d2"] = map[string]bool{"cy": true}
+	e.Data["cy"] = map[string]int{"d2": 6}
+
+	filters := map[string][]interface{}{"id": {"d2"}}
+	queries := map[string][]string{
+		"raw":   {"a", "b", "c"},
+		"exact": {"a", "b"},
+	}
+	res := e.SearchMoreThanDoubleTermsWithPrefixWithFilter(queries, filters, 0)
+	if len(res) != 1 || res[0].ID != "d2" {
+		t.Fatalf("expected only d2, got %v", res)
+	}
+}
+
+func TestSearchMoreThanDoubleTermsWithFilter(t *testing.T) {
+	e := newTestEngineForMultipleTerm(5)
+	e.FilterDocs["id:d1"] = map[string]bool{"d1": true}
+	e.FilterDocs["id:d2"] = map[string]bool{"d2": true}
+
+	e.ScoreIndex["a"] = []Document{{ID: "d1", Data: nil, ScoreWeight: 1}, {ID: "d2", Data: nil, ScoreWeight: 2}}
+	e.Documents["d1"] = map[string]interface{}{"": nil}
+	e.Documents["d2"] = map[string]interface{}{"": nil}
+	e.Data["b"] = map[string]int{"d1": 3, "d2": 4}
+	e.Data["d"] = map[string]int{"d2": 5}
+
+	filters := map[string][]interface{}{"id": {"d1", "d2"}}
+	queries := map[string][]string{
+		"raw":    {"a", "b", "d"},
+		"exact":  {"a", "b"},
+		"prefix": {"d"},
+		"fuzzy":  nil,
+	}
+	res := e.SearchMoreThanDoubleTermsWithFilter(queries, filters, 0)
+	if len(res) != 1 || res[0].ID != "d2" {
+		t.Fatalf("expected only d2, got %v", res)
+	}
+	if res[0].ScoreWeight != 2+4+5 {
+		t.Errorf("score = %d; want %d", res[0].ScoreWeight, 11)
+	}
+}
+
+// helper to extract IDs
+func getIDs(docs []Document) []string {
+	ids := make([]string, len(docs))
+	for i, d := range docs {
+		ids[i] = d.ID
+	}
+	return ids
+}
+
+func TestSearchEngineFlow_MultiTerm_LastTermLessThan2(t *testing.T) {
+	var docs []map[string]interface{}
+	if err := json.Unmarshal(testProducts2JSON, &docs); err != nil {
+		t.Fatalf("Failed to unmarshal test JSON: %v", err)
+	}
+
+	engine := NewSearchEngine(
+		[]string{"name", "tags"},
+		map[string]bool{"year": true},
+		5, // pageSize
+		0, // shardID unused
 	)
-	queries := map[string][]string{"exact": {"foo"}, "prefix": {}, "fuzzy": {}}
-	res := se.SearchMultipleTermsWithFilter(queries, map[string][]interface{}{"type": {"all"}}, 0)
-	// Expect two documents in original order with data and weight
-	exp := []Document{
-		{ID: "d1", Data: docs["d1"], ScoreWeight: 5},
-		{ID: "d2", Data: docs["d2"], ScoreWeight: 3},
-	}
-	if !reflect.DeepEqual(res, exp) {
-		t.Errorf("expected %v, got %v", exp, res)
-	}
-}
 
-func TestSearchMultipleTermsWithFilter_MultipleExact_TermFiltering(t *testing.T) {
-	// exact terms: foo, bar, baz. Only d1 has all
-	scoreIdx := map[string][]Document{
-		"foo": {{ID: "d1", ScoreWeight: 5}, {ID: "d2", ScoreWeight: 5}},
-	}
-	weights := map[string]map[string]int{
-		"bar": {"d1": 2, "d2": 2},
-		"baz": {"d1": 3}, // d2 missing baz
-	}
-	docs := map[string]map[string]interface{}{
-		"d1": {"value": "A"},
-		"d2": {"value": "B"},
-	}
-	filterDocs := map[string]map[string]bool{"all:yes": {"d1": true, "d2": true}}
-	se := newTestEngineForMultipleTerm(10, scoreIdx, weights, docs, filterDocs)
-	queries := map[string][]string{"exact": {"foo", "bar", "baz"}, "prefix": {}, "fuzzy": {}}
-	res := se.SearchMultipleTermsWithFilter(queries, map[string][]interface{}{"all": {"yes"}}, 0)
-	// Only d1, score =5+2+3=10
-	exp := []Document{{ID: "d1", Data: docs["d1"], ScoreWeight: 10}}
-	if !reflect.DeepEqual(res, exp) {
-		t.Errorf("expected %v, got %v", exp, res)
-	}
-}
+	engine.Index(0, docs)
 
-func TestSearchMultipleTermsWithFilter_WithOtherTerms(t *testing.T) {
-	// exact=foo; prefix=[p1,p2]; fuzzy=[f1]
-	scoreIdx := map[string][]Document{
-		"foo": {{ID: "d1", ScoreWeight: 4}, {ID: "d2", ScoreWeight: 7}},
-	}
-	weights := map[string]map[string]int{
-		"p1": {"d2": 1},
-		"p2": {"d1": 2},
-		"f1": {"d1": 3, "d2": 3},
-	}
-	docs := map[string]map[string]interface{}{
-		"d1": {"value": "A"},
-		"d2": {"value": "B"},
-	}
-	filterDocs := map[string]map[string]bool{"all:yes": {"d1": true, "d2": true}}
-	se := newTestEngineForMultipleTerm(10, scoreIdx, weights, docs, filterDocs)
-	queries := map[string][]string{"exact": {"foo"}, "prefix": {"p1", "p2"}, "fuzzy": {"f1"}}
-	res := se.SearchMultipleTermsWithFilter(queries, map[string][]interface{}{"all": {"yes"}}, 0)
-	// d1: found at p2(index1) => score=4 + p2(2)+f1(3)=9
-	// d2: found at p1(index0) => score=7 + p1(1)+p2 missing(0)+f1(3)=11
-	exp := []Document{
-		{ID: "d1", Data: docs["d1"], ScoreWeight: 9},
-		{ID: "d2", Data: docs["d2"], ScoreWeight: 11},
-	}
-	if !reflect.DeepEqual(res, exp) {
-		t.Errorf("expected %v, got %v", exp, res)
-	}
-}
+	emptyFilters := make(map[string][]interface{})
 
-func TestSearchMultipleTermsWithFilter_Paging(t *testing.T) {
-	// page size 1, two docs => page1 returns second only
-	scoreIdx := map[string][]Document{"foo": {{ID: "d1", ScoreWeight: 1}, {ID: "d2", ScoreWeight: 2}}}
-	weights := map[string]map[string]int{}
-	docs := map[string]map[string]interface{}{
-		"d1": {"value": "A"},
-		"d2": {"value": "B"},
-	}
-	filterDocs := map[string]map[string]bool{"all:yes": {"d1": true, "d2": true}}
-	se := newTestEngineForMultipleTerm(1, scoreIdx, weights, docs, filterDocs)
-	queries := map[string][]string{"exact": {"foo"}, "prefix": {}, "fuzzy": {}}
-	res := se.SearchMultipleTermsWithFilter(queries, map[string][]interface{}{"all": {"yes"}}, 1)
-	exp := []Document{{ID: "d2", Data: docs["d2"], ScoreWeight: 2}}
-	if !reflect.DeepEqual(res, exp) {
-		t.Errorf("expected page 1 result %v, got %v", exp, res)
-	}
-}
+	// map[exact:[smart] prefix:[crop clay cream compact] raw:[smart c]]
+	result := engine.Search("smart c", 0, emptyFilters, 5)
+	resultDocs := result.Docs
 
-func TestSearchMultipleTermsWithFilter_FilterExcludesAll(t *testing.T) {
-	// filter only d3, but scoreIdx has d1,d2 => no docs
-	scoreIdx := map[string][]Document{"foo": {{ID: "d1", ScoreWeight: 1}, {ID: "d2", ScoreWeight: 2}}}
-	weights := map[string]map[string]int{}
-	docs := map[string]map[string]interface{}{
-		"d1": {"value": "A"},
-		"d2": {"value": "B"},
+	sort.Slice(resultDocs, func(i, j int) bool {
+		return resultDocs[i].ScoreWeight > resultDocs[j].ScoreWeight
+	})
+
+	if len(resultDocs) != 5 {
+		t.Fatalf("expected 5 results, got %d", len(resultDocs))
 	}
-	filterDocs := map[string]map[string]bool{"all:yes": {"d3": true}}
-	se := newTestEngineForMultipleTerm(5, scoreIdx, weights, docs, filterDocs)
-	queries := map[string][]string{"exact": {"foo"}, "prefix": {}, "fuzzy": {}}
-	res := se.SearchMultipleTermsWithFilter(queries, map[string][]interface{}{"all": {"yes"}}, 0)
-	if res != nil {
-		t.Errorf("expected nil, got %v", res)
+	if resultDocs[0].ID != "13" || resultDocs[0].ScoreWeight != 100000 {
+		t.Errorf("for 'smart c', expected {ID:\"13\",ScoreWeight:100000}, got %s - %d", resultDocs[0].ID, resultDocs[0].ScoreWeight)
 	}
-	if len(res) != 0 {
-		t.Errorf("expected 0 docs, got %d", len(res))
+	if resultDocs[1].ID != "12" || resultDocs[1].ScoreWeight != 99999 {
+		t.Errorf("for 'smart c', expected {ID:\"12\",ScoreWeight:99999}, got %s - %d", resultDocs[1].ID, resultDocs[1].ScoreWeight)
+	}
+	if !((resultDocs[2].ID == "28" ||
+		resultDocs[2].ID == "2" ||
+		resultDocs[2].ID == "22") && resultDocs[2].ScoreWeight == 66666) {
+		t.Errorf("for 'smart c', expected {ID:\"28, 2, 22\",ScoreWeight:66666}, got %s - %d", resultDocs[2].ID, resultDocs[2].ScoreWeight)
+	}
+	if !((resultDocs[3].ID == "28" ||
+		resultDocs[3].ID == "2" ||
+		resultDocs[3].ID == "22") && resultDocs[3].ScoreWeight == 66666) {
+		t.Errorf("for 'smart c', expected {ID:\"28, 2, 22\",ScoreWeight:66666}, got %s - %d", resultDocs[3].ID, resultDocs[3].ScoreWeight)
+	}
+	if !((resultDocs[4].ID == "28" ||
+		resultDocs[4].ID == "2" ||
+		resultDocs[4].ID == "22") && resultDocs[4].ScoreWeight == 66666) {
+		t.Errorf("for 'smart c', expected {ID:\"28, 2, 22\",ScoreWeight:66666}, got %s - %d", resultDocs[4].ID, resultDocs[4].ScoreWeight)
+	}
+
+	result = engine.Search("smart c", 1, emptyFilters, 5)
+	resultDocs = result.Docs
+
+	sort.Slice(resultDocs, func(i, j int) bool {
+		return resultDocs[i].ScoreWeight > resultDocs[j].ScoreWeight
+	})
+
+	if len(resultDocs) != 5 {
+		t.Fatalf("expected 5 results, got %d", len(resultDocs))
+	}
+	if !((resultDocs[0].ID == "17" ||
+		resultDocs[0].ID == "10" ||
+		resultDocs[0].ID == "9" ||
+		resultDocs[0].ID == "19") && resultDocs[0].ScoreWeight == 50000) {
+		t.Errorf("for 'smart c', expected {ID:\"17, 10, 9, 19\",ScoreWeight:50000}, got %s - %d", resultDocs[0].ID, resultDocs[0].ScoreWeight)
+	}
+	if !((resultDocs[1].ID == "17" ||
+		resultDocs[1].ID == "10" ||
+		resultDocs[1].ID == "9" ||
+		resultDocs[1].ID == "19") && resultDocs[1].ScoreWeight == 50000) {
+		t.Errorf("for 'smart c', expected {ID:\"17, 10, 9, 19\",ScoreWeight:50000}, got %s - %d", resultDocs[1].ID, resultDocs[1].ScoreWeight)
+	}
+	if !((resultDocs[2].ID == "17" ||
+		resultDocs[2].ID == "10" ||
+		resultDocs[2].ID == "9" ||
+		resultDocs[2].ID == "19") && resultDocs[2].ScoreWeight == 50000) {
+		t.Errorf("for 'smart c', expected {ID:\"17, 10, 9, 19\",ScoreWeight:50000}, got %s - %d", resultDocs[2].ID, resultDocs[2].ScoreWeight)
+	}
+	if !((resultDocs[3].ID == "17" ||
+		resultDocs[3].ID == "10" ||
+		resultDocs[3].ID == "9" ||
+		resultDocs[3].ID == "19") && resultDocs[3].ScoreWeight == 50000) {
+		t.Errorf("for 'smart c', expected {ID:\"17, 10, 9, 19\",ScoreWeight:50000}, got %s - %d", resultDocs[3].ID, resultDocs[3].ScoreWeight)
+	}
+	if resultDocs[4].ID != "26" || resultDocs[4].ScoreWeight != 40000 {
+		t.Errorf("for 'smart c', expected {ID:\"26\",ScoreWeight:40000}, got %s - %d", resultDocs[4].ID, resultDocs[4].ScoreWeight)
+	}
+
+	result = engine.Search("smart c", 2, emptyFilters, 5)
+	resultDocs = result.Docs
+
+	if len(resultDocs) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(resultDocs))
+	}
+	if !((resultDocs[0].ID == "27" ||
+		resultDocs[0].ID == "15") && resultDocs[0].ScoreWeight == 33332) {
+		t.Errorf("for 'smart c', expected {ID:\"27, 15\",ScoreWeight:33332}, got %s - %d", resultDocs[0].ID, resultDocs[0].ScoreWeight)
+	}
+	if !((resultDocs[1].ID == "27" ||
+		resultDocs[1].ID == "15") && resultDocs[1].ScoreWeight == 33332) {
+		t.Errorf("for 'smart c', expected {ID:\"27, 15\",ScoreWeight:33332}, got %s - %d", resultDocs[1].ID, resultDocs[1].ScoreWeight)
 	}
 }

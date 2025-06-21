@@ -40,12 +40,13 @@ type TokenFieldPair struct {
 
 // stopWords lists common words to exclude from indexing.
 var stopWords = map[string]bool{
-	"is": true, "a": true, "the": true, "and": true, "or": true, "to": true, "in": true, "of": true,
+	// "is": true, "a": true, "the": true, "and": true, "or": true, "to": true, "in": true, "of": true,
 }
 
 // enginePayload serializes the core SearchEngine state.
 type enginePayload struct {
 	Data        map[string]map[string]int
+	DocData     map[string]map[string]bool
 	Documents   map[string]map[string]interface{}
 	ScoreIndex  map[string][]Document
 	FilterDocs  map[string]map[string]bool
@@ -60,6 +61,7 @@ type enginePayload struct {
 type SearchEngine struct {
 	ShardID     int
 	Data        map[string]map[string]int         // term -> docID -> int
+	DocData     map[string]map[string]bool        // docID -> term -> true
 	Documents   map[string]map[string]interface{} // docID -> fields
 	ScoreIndex  map[string][]Document             // term -> Documents (ordered by weight desc)
 	FilterDocs  map[string]map[string]bool        // filter -> docID e.g., map["year:2019"]map["doc1"] = true
@@ -79,6 +81,7 @@ func NewSearchEngine(
 	return &SearchEngine{
 		ShardID:     shardID,
 		Data:        make(map[string]map[string]int),
+		DocData:     make(map[string]map[string]bool),
 		Documents:   make(map[string]map[string]interface{}),
 		IndexFields: indexFields,
 		Filters:     filters,
@@ -105,6 +108,7 @@ func (se *SearchEngine) SaveAll(path string) error {
 	se.mu.RLock()
 	payload := enginePayload{
 		Data:        se.Data,
+		DocData:     se.DocData,
 		Documents:   se.Documents,
 		FilterDocs:  se.FilterDocs,
 		IndexFields: se.IndexFields,
@@ -135,6 +139,7 @@ func (se *SearchEngine) SaveAll(path string) error {
 func LoadAll(path string, shardID int) (*SearchEngine, error) {
 	se := &SearchEngine{
 		Data:        make(map[string]map[string]int),
+		DocData:     make(map[string]map[string]bool),
 		Documents:   make(map[string]map[string]interface{}),
 		ScoreIndex:  make(map[string][]Document),
 		FilterDocs:  make(map[string]map[string]bool),
@@ -157,6 +162,7 @@ func LoadAll(path string, shardID int) (*SearchEngine, error) {
 		f.Close()
 
 		se.Data = payload.Data
+		se.DocData = payload.DocData
 		se.Documents = payload.Documents
 		// se.ScoreIndex = payload.ScoreIndex
 		se.FilterDocs = payload.FilterDocs
@@ -206,7 +212,7 @@ func (se *SearchEngine) ProcessQuery(query string, prefixCount int) (map[string]
 	}
 
 	result := make(map[string][]string)
-
+	result["raw"] = queryTokens
 	if tokenCount == 1 {
 		guessArr := se.Trie.SearchPrefix(queryTokens[0], prefixCount)
 		if guessArr != nil {
@@ -214,7 +220,7 @@ func (se *SearchEngine) ProcessQuery(query string, prefixCount int) (map[string]
 		} else {
 			fuzzyMatch := false
 			for key := range se.Keys.GetData() {
-				if FuzzyMatch(key, queryTokens[0], 2) {
+				if FuzzyMatch(key, queryTokens[0], 1) {
 					result["fuzzy"] = append(result["fuzzy"], key)
 					fuzzyMatch = true
 					break
@@ -226,14 +232,36 @@ func (se *SearchEngine) ProcessQuery(query string, prefixCount int) (map[string]
 		}
 	} else {
 		lastWord := queryTokens[tokenCount-1]
-		result["exact"] = append(result["exact"], queryTokens[:tokenCount-1]...)
+		for _, exactWords := range queryTokens[:tokenCount-1] {
+			_, ok := se.Keys.GetData()[exactWords]
+			if ok {
+				result["exact"] = append(result["exact"], exactWords)
+			} else {
+				guessArr := se.Trie.SearchPrefix(exactWords, 1)
+				if guessArr != nil {
+					result["exact"] = append(result["exact"], guessArr[0])
+				} else {
+					fuzzyMatch := false
+					for key := range se.Keys.GetData() {
+						if FuzzyMatch(key, exactWords, 1) {
+							result["exact"] = append(result["exact"], key)
+							fuzzyMatch = true
+							break
+						}
+					}
+					if !fuzzyMatch {
+						result["exact"] = append(result["exact"], lastWord)
+					}
+				}
+			}
+		}
 		guessArr := se.Trie.SearchPrefix(lastWord, prefixCount)
 		if guessArr != nil {
 			result["prefix"] = append(result["prefix"], guessArr...)
 		} else {
 			fuzzyMatch := false
 			for key := range se.Keys.GetData() {
-				if FuzzyMatch(key, lastWord, 2) {
+				if FuzzyMatch(key, lastWord, 1) {
 					result["fuzzy"] = append(result["fuzzy"], key)
 					fuzzyMatch = true
 					break
@@ -334,7 +362,17 @@ func (se *SearchEngine) BuildDocumentIndex(docs []map[string]interface{}) {
 			}
 		}
 
+		se.mu.RLock()
+		docDataMap, ok := se.DocData[docID]
+		se.mu.RUnlock()
+		if !ok {
+			docDataMap = make(map[string]bool)
+			se.mu.Lock()
+			se.DocData[docID] = docDataMap
+			se.mu.Unlock()
+		}
 		for _, token := range allTokens {
+			docDataMap[token] = true
 			se.addToDocumentIndex(token, docID, len(allTokens))
 		}
 
@@ -480,6 +518,189 @@ func (se *SearchEngine) SearchOneTermWithFilter(query string, filters map[string
 
 // SearchMultipleTermsWithoutFilter is a public wrapper for multi-term searches without filters.
 func (se *SearchEngine) SearchMultipleTermsWithoutFilter(queriesMap map[string][]string, page int) []Document {
+	if len(queriesMap["raw"]) == 2 {
+		if len(queriesMap["raw"][1]) <= 2 {
+			return se.SearchDoubleTermsWithPrefixWithoutFilter(queriesMap, page)
+		} else {
+			return se.SearchDoubleTermsWithoutFilter(queriesMap, page)
+		}
+	} else {
+		if len(queriesMap["raw"][len(queriesMap["raw"])-1]) <= 2 {
+			return se.SearchMoreThanDoubleTermsWithPrefixWithoutFilter(queriesMap, page)
+		} else {
+			return se.SearchMoreThanDoubleTermsWithoutFilter(queriesMap, page)
+		}
+	}
+}
+
+// SearchDoubleTermsWithPrefixWithoutFilter is a public double-term search function with prefix without filters.
+func (se *SearchEngine) SearchDoubleTermsWithPrefixWithoutFilter(queriesMap map[string][]string, page int) []Document {
+	var finalDocs []Document
+
+	firstTerm := queriesMap["exact"][0]
+	secondTerm := queriesMap["raw"][1]
+	se.mu.RLock()
+	defer se.mu.RUnlock()
+
+	startIndex := page * se.PageSize
+	stopIndex := startIndex + se.PageSize
+
+	for _, doc := range se.ScoreIndex[firstTerm] {
+		totalScore := doc.ScoreWeight
+		hasPrefix := false
+		for term, _ := range se.DocData[doc.ID] {
+			if strings.HasPrefix(term, secondTerm) {
+				hasPrefix = true
+				totalScore += se.Data[term][doc.ID]
+			}
+		}
+
+		if !hasPrefix {
+			continue
+		}
+
+		finalDocs = append(finalDocs, Document{
+			ID:          doc.ID,
+			Data:        se.Documents[doc.ID],
+			ScoreWeight: totalScore,
+		})
+		if len(finalDocs) >= stopIndex {
+			break
+		}
+	}
+
+	if startIndex > len(finalDocs) {
+		return nil
+	}
+	if stopIndex > len(finalDocs) {
+		stopIndex = len(finalDocs)
+	}
+
+	return finalDocs[startIndex:stopIndex]
+}
+
+// SearchDoubleTermsWithoutFilter is a public double-term search function without filters.
+func (se *SearchEngine) SearchDoubleTermsWithoutFilter(queriesMap map[string][]string, page int) []Document {
+	var finalDocs []Document
+
+	firstTerm := queriesMap["exact"][0]
+	se.mu.RLock()
+	scoreIndexLength := se.ScoreIndex[firstTerm]
+	se.mu.RUnlock()
+	// TODO: magic number, make it configurative
+	if len(scoreIndexLength) < 250 {
+		return se.SearchDoubleTermsWithPrefixWithoutFilter(queriesMap, page)
+	}
+
+	otherTerms := append(queriesMap["prefix"], queriesMap["fuzzy"]...)
+	se.mu.RLock()
+	defer se.mu.RUnlock()
+
+	startIndex := page * se.PageSize
+	stopIndex := startIndex + se.PageSize
+
+	for _, doc := range se.ScoreIndex[firstTerm] {
+		foundOther := false
+		otherWeight := 0
+		for _, term := range otherTerms {
+			if otherData, ok := se.Data[term][doc.ID]; ok {
+				foundOther = true
+				otherWeight += otherData
+				// break
+			}
+		}
+		if !foundOther {
+			continue
+		}
+
+		totalScore := doc.ScoreWeight + otherWeight
+
+		finalDocs = append(finalDocs, Document{
+			ID:          doc.ID,
+			Data:        se.Documents[doc.ID],
+			ScoreWeight: totalScore,
+		})
+		if len(finalDocs) >= stopIndex {
+			break
+		}
+	}
+
+	if startIndex > len(finalDocs) {
+		return nil
+	}
+	if stopIndex > len(finalDocs) {
+		stopIndex = len(finalDocs)
+	}
+
+	return finalDocs[startIndex:stopIndex]
+}
+
+// SearchMoreThanDoubleTermsWithPrefixWithoutFilter is a public multi-term search function with prefix for without filters.
+func (se *SearchEngine) SearchMoreThanDoubleTermsWithPrefixWithoutFilter(queriesMap map[string][]string, page int) []Document {
+	exactTerms := queriesMap["exact"]
+	secondTerm := queriesMap["raw"][len(queriesMap["raw"])-1]
+
+	var finalDocs []Document
+
+	inputTerm := exactTerms[0]
+
+	se.mu.RLock()
+	defer se.mu.RUnlock()
+
+	startIndex := page * se.PageSize
+	stopIndex := startIndex + se.PageSize
+
+	for _, doc := range se.ScoreIndex[inputTerm] {
+		inAllExact := true
+		allOtherExactWeights := 0
+		for i := 1; i < len(exactTerms); i++ {
+			otherExactWeight, ok := se.Data[exactTerms[i]][doc.ID]
+			if !ok {
+				inAllExact = false
+				break
+			}
+			allOtherExactWeights += otherExactWeight
+		}
+		if !inAllExact {
+			continue
+		}
+
+		totalScore := doc.ScoreWeight + allOtherExactWeights
+
+		hasPrefix := false
+		for term, _ := range se.DocData[doc.ID] {
+			if strings.HasPrefix(term, secondTerm) {
+				hasPrefix = true
+				totalScore += se.Data[term][doc.ID]
+			}
+		}
+
+		if !hasPrefix {
+			continue
+		}
+
+		finalDocs = append(finalDocs, Document{
+			ID:          doc.ID,
+			Data:        se.Documents[doc.ID],
+			ScoreWeight: totalScore,
+		})
+		if len(finalDocs) >= stopIndex {
+			break
+		}
+	}
+
+	if startIndex > len(finalDocs) {
+		return nil
+	}
+	if stopIndex > len(finalDocs) {
+		stopIndex = len(finalDocs)
+	}
+
+	return finalDocs[startIndex:stopIndex]
+}
+
+// SearchMoreThanDoubleTermsWithoutFilter is a public multi-term search function for without filters.
+func (se *SearchEngine) SearchMoreThanDoubleTermsWithoutFilter(queriesMap map[string][]string, page int) []Document {
 	exactTerms := queriesMap["exact"]
 	otherTerms := append(queriesMap["prefix"], queriesMap["fuzzy"]...)
 
@@ -497,42 +718,35 @@ func (se *SearchEngine) SearchMultipleTermsWithoutFilter(queriesMap map[string][
 
 	for _, doc := range se.ScoreIndex[inputTerm] {
 		inAllExact := true
+		allOtherExactWeights := 0
 		for i := 1; i < len(exactTerms); i++ {
-			if _, ok := se.Data[exactTerms[i]][doc.ID]; !ok {
+			otherExactWeight, ok := se.Data[exactTerms[i]][doc.ID]
+			if !ok {
 				inAllExact = false
 				break
 			}
+			allOtherExactWeights += otherExactWeight
 		}
 		if !inAllExact {
 			continue
 		}
 
-		otherTermIndex := 0
-		if len(otherTerms) > 0 {
-			foundOther := false
-			for k, term := range otherTerms {
-				if _, ok := se.Data[term][doc.ID]; ok {
-					foundOther = true
-					otherTermIndex = k
-					break
-				}
-			}
-			if !foundOther {
-				continue
+		totalScore := doc.ScoreWeight + allOtherExactWeights
+
+		foundOther := false
+		otherWeight := 0
+		for _, term := range otherTerms {
+			if otherData, ok := se.Data[term][doc.ID]; ok {
+				foundOther = true
+				otherWeight += otherData
+				// break
 			}
 		}
-
-		totalScore := doc.ScoreWeight
-
-		for i := 1; i < len(exactTerms); i++ {
-			weight := se.Data[exactTerms[i]][doc.ID]
-			totalScore += weight
+		if !foundOther {
+			continue
 		}
 
-		for i := otherTermIndex; i < len(otherTerms); i++ {
-			weight := se.Data[otherTerms[i]][doc.ID]
-			totalScore += weight
-		}
+		totalScore += otherWeight
 
 		finalDocs = append(finalDocs, Document{
 			ID:          doc.ID,
@@ -556,8 +770,199 @@ func (se *SearchEngine) SearchMultipleTermsWithoutFilter(queriesMap map[string][
 
 // SearchMultipleTermsWithFilter is a public wrapper for multi-term searches with filters.
 func (se *SearchEngine) SearchMultipleTermsWithFilter(queriesMap map[string][]string, filters map[string][]interface{}, page int) []Document {
-	filteredDocs := se.ApplyFilter(filters)
+	if len(queriesMap["raw"]) == 2 {
+		if len(queriesMap["raw"][1]) <= 2 {
+			return se.SearchDoubleTermsWithPrefixWithFilter(queriesMap, filters, page)
+		} else {
+			return se.SearchDoubleTermsWithFilter(queriesMap, filters, page)
+		}
+	} else if len(queriesMap["raw"]) > 2 {
+		if len(queriesMap["raw"][len(queriesMap["raw"])-1]) <= 2 {
+			return se.SearchMoreThanDoubleTermsWithPrefixWithFilter(queriesMap, filters, page)
+		} else {
+			return se.SearchMoreThanDoubleTermsWithFilter(queriesMap, filters, page)
+		}
+	}
+	return nil
+}
 
+// SearchDoubleTermsWithPrefixWithFilter is a public double-term search function with prefix with filters.
+func (se *SearchEngine) SearchDoubleTermsWithPrefixWithFilter(
+	queriesMap map[string][]string, filters map[string][]interface{}, page int) []Document {
+	filteredDocs := se.ApplyFilter(filters)
+	var finalDocs []Document
+
+	firstTerm := queriesMap["exact"][0]
+	secondTerm := queriesMap["raw"][1]
+	se.mu.RLock()
+	defer se.mu.RUnlock()
+
+	startIndex := page * se.PageSize
+	stopIndex := startIndex + se.PageSize
+
+	for _, doc := range se.ScoreIndex[firstTerm] {
+		if _, ok := filteredDocs[doc.ID]; !ok {
+			continue
+		}
+		totalScore := doc.ScoreWeight
+		hasPrefix := false
+		for term, _ := range se.DocData[doc.ID] {
+			if strings.HasPrefix(term, secondTerm) {
+				hasPrefix = true
+				totalScore += se.Data[term][doc.ID]
+			}
+		}
+
+		if !hasPrefix {
+			continue
+		}
+
+		finalDocs = append(finalDocs, Document{
+			ID:          doc.ID,
+			Data:        se.Documents[doc.ID],
+			ScoreWeight: totalScore,
+		})
+		if len(finalDocs) >= stopIndex {
+			break
+		}
+	}
+
+	if startIndex > len(finalDocs) {
+		return nil
+	}
+	if stopIndex > len(finalDocs) {
+		stopIndex = len(finalDocs)
+	}
+
+	return finalDocs[startIndex:stopIndex]
+}
+
+// SearchDoubleTermsWithFilter is a public double-term search function with filters.
+func (se *SearchEngine) SearchDoubleTermsWithFilter(
+	queriesMap map[string][]string, filters map[string][]interface{}, page int) []Document {
+	filteredDocs := se.ApplyFilter(filters)
+	var finalDocs []Document
+
+	firstTerm := queriesMap["exact"][0]
+	otherTerms := append(queriesMap["prefix"], queriesMap["fuzzy"]...)
+	se.mu.RLock()
+	defer se.mu.RUnlock()
+
+	startIndex := page * se.PageSize
+	stopIndex := startIndex + se.PageSize
+
+	for _, doc := range se.ScoreIndex[firstTerm] {
+		if _, ok := filteredDocs[doc.ID]; !ok {
+			continue
+		}
+		foundOther := false
+		otherWeight := 0
+		for _, term := range otherTerms {
+			if otherData, ok := se.Data[term][doc.ID]; ok {
+				foundOther = true
+				otherWeight += otherData
+				// break
+			}
+		}
+		if !foundOther {
+			continue
+		}
+
+		totalScore := doc.ScoreWeight + otherWeight
+
+		finalDocs = append(finalDocs, Document{
+			ID:          doc.ID,
+			Data:        se.Documents[doc.ID],
+			ScoreWeight: totalScore,
+		})
+		if len(finalDocs) >= stopIndex {
+			break
+		}
+	}
+
+	if startIndex > len(finalDocs) {
+		return nil
+	}
+	if stopIndex > len(finalDocs) {
+		stopIndex = len(finalDocs)
+	}
+
+	return finalDocs[startIndex:stopIndex]
+}
+
+// SearchMoreThanDoubleTermsWithPrefixWithFilter is a public multi-term search function with prefix for with filters.
+func (se *SearchEngine) SearchMoreThanDoubleTermsWithPrefixWithFilter(
+	queriesMap map[string][]string, filters map[string][]interface{}, page int) []Document {
+	filteredDocs := se.ApplyFilter(filters)
+	exactTerms := queriesMap["exact"]
+	secondTerm := queriesMap["raw"][len(queriesMap["raw"])-1]
+
+	var finalDocs []Document
+
+	inputTerm := exactTerms[0]
+
+	se.mu.RLock()
+	defer se.mu.RUnlock()
+
+	startIndex := page * se.PageSize
+	stopIndex := startIndex + se.PageSize
+
+	for _, doc := range se.ScoreIndex[inputTerm] {
+		if _, ok := filteredDocs[doc.ID]; !ok {
+			continue
+		}
+		inAllExact := true
+		allOtherExactWeights := 0
+		for i := 1; i < len(exactTerms); i++ {
+			otherExactWeight, ok := se.Data[exactTerms[i]][doc.ID]
+			if !ok {
+				inAllExact = false
+				break
+			}
+			allOtherExactWeights += otherExactWeight
+		}
+		if !inAllExact {
+			continue
+		}
+
+		totalScore := doc.ScoreWeight + allOtherExactWeights
+
+		hasPrefix := false
+		for term, _ := range se.DocData[doc.ID] {
+			if strings.HasPrefix(term, secondTerm) {
+				hasPrefix = true
+				totalScore += se.Data[term][doc.ID]
+			}
+		}
+
+		if !hasPrefix {
+			continue
+		}
+
+		finalDocs = append(finalDocs, Document{
+			ID:          doc.ID,
+			Data:        se.Documents[doc.ID],
+			ScoreWeight: totalScore,
+		})
+		if len(finalDocs) >= stopIndex {
+			break
+		}
+	}
+
+	if startIndex > len(finalDocs) {
+		return nil
+	}
+	if stopIndex > len(finalDocs) {
+		stopIndex = len(finalDocs)
+	}
+
+	return finalDocs[startIndex:stopIndex]
+}
+
+// SearchMoreThanDoubleTermsWithFilter is a public multi-term search function for with filters.
+func (se *SearchEngine) SearchMoreThanDoubleTermsWithFilter(
+	queriesMap map[string][]string, filters map[string][]interface{}, page int) []Document {
+	filteredDocs := se.ApplyFilter(filters)
 	exactTerms := queriesMap["exact"]
 	otherTerms := append(queriesMap["prefix"], queriesMap["fuzzy"]...)
 
@@ -578,42 +983,35 @@ func (se *SearchEngine) SearchMultipleTermsWithFilter(queriesMap map[string][]st
 			continue
 		}
 		inAllExact := true
+		allOtherExactWeights := 0
 		for i := 1; i < len(exactTerms); i++ {
-			if _, ok := se.Data[exactTerms[i]][doc.ID]; !ok {
+			otherExactWeight, ok := se.Data[exactTerms[i]][doc.ID]
+			if !ok {
 				inAllExact = false
 				break
 			}
+			allOtherExactWeights += otherExactWeight
 		}
 		if !inAllExact {
 			continue
 		}
 
-		otherTermIndex := 0
-		if len(otherTerms) > 0 {
-			foundOther := false
-			for k, term := range otherTerms {
-				if _, ok := se.Data[term][doc.ID]; ok {
-					foundOther = true
-					otherTermIndex = k
-					break
-				}
-			}
-			if !foundOther {
-				continue
+		totalScore := doc.ScoreWeight + allOtherExactWeights
+
+		foundOther := false
+		otherWeight := 0
+		for _, term := range otherTerms {
+			if otherData, ok := se.Data[term][doc.ID]; ok {
+				foundOther = true
+				otherWeight += otherData
+				// break
 			}
 		}
-
-		totalScore := doc.ScoreWeight
-
-		for i := 1; i < len(exactTerms); i++ {
-			weight := se.Data[exactTerms[i]][doc.ID]
-			totalScore += weight
+		if !foundOther {
+			continue
 		}
 
-		for i := otherTermIndex; i < len(otherTerms); i++ {
-			weight := se.Data[otherTerms[i]][doc.ID]
-			totalScore += weight
-		}
+		totalScore += otherWeight
 
 		finalDocs = append(finalDocs, Document{
 			ID:          doc.ID,
@@ -624,6 +1022,7 @@ func (se *SearchEngine) SearchMultipleTermsWithFilter(queriesMap map[string][]st
 			break
 		}
 	}
+
 	if startIndex > len(finalDocs) {
 		return nil
 	}
@@ -667,7 +1066,7 @@ func (se *SearchEngine) searchWithTokens(queryTokens map[string][]string, page i
 				IsMultiTerm: true,
 				IsFuzzy:     false,
 				IsPrefix:    false,
-				IsExact:     true,
+				IsExact:     false,
 			}
 		}
 	} else {
@@ -702,7 +1101,7 @@ func (se *SearchEngine) searchWithTokens(queryTokens map[string][]string, page i
 				IsMultiTerm: true,
 				IsFuzzy:     false,
 				IsPrefix:    false,
-				IsExact:     true,
+				IsExact:     false,
 			}
 		}
 	}
