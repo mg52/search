@@ -27,6 +27,7 @@ type AddToIndexResponse struct {
 	AddedCount int    `json:"addedCount"`
 	Duration   string `json:"duration"`
 	DurationMs int64  `json:"durationMs"`
+	TotalDocs  int64  `json:"totalDocs"`
 }
 
 // CreateIndexRequest is the payload for creating index.
@@ -109,7 +110,7 @@ func (ht *HTTP) Search(w http.ResponseWriter, r *http.Request) {
 		for _, item := range strings.Split(filterStr, ",") {
 			parts := strings.SplitN(item, ":", 2)
 			if len(parts) != 2 {
-				fmt.Printf("Skipping invalid filter: %s\n", item)
+				// fmt.Printf("Skipping invalid filter: %s\n", item)
 				continue
 			}
 			key, val := parts[0], parts[1]
@@ -119,7 +120,7 @@ func (ht *HTTP) Search(w http.ResponseWriter, r *http.Request) {
 
 	result := sec.Search(query, pageInt, filters)
 	duration := time.Since(startTime)
-	fmt.Printf("Search [%s] took %s for query %q\n", indexName, duration, query)
+	// fmt.Printf("Search [%s] took %s for query %q\n", indexName, duration, query)
 
 	resp := map[string]interface{}{
 		"status":     "success",
@@ -272,6 +273,7 @@ func (ht *HTTP) AddToIndex(w http.ResponseWriter, r *http.Request) {
 		AddedCount: len(docs),
 		Duration:   elapsed.String(),
 		DurationMs: elapsed.Milliseconds(),
+		TotalDocs:  sec.NumberOfTotalDocs,
 	})
 }
 

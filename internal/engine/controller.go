@@ -17,7 +17,7 @@ type SearchEngineController struct {
 	IndexFields       []string        // document fields to index
 	Filters           map[string]bool // fields available for filtering
 	PageSize          int             // approximate results per page in each shard
-	NumberOfTotalDocs int             // Number of total documents in the engine
+	NumberOfTotalDocs int64           // Number of total documents in the engine
 	mu                sync.RWMutex
 }
 
@@ -109,9 +109,10 @@ func (sec *SearchEngineController) LoadAllShards(indexName string) error {
 	sec.IndexFields = first.IndexFields
 
 	for _, engine := range sec.Engines {
-		sec.NumberOfTotalDocs += len(engine.Documents)
+		sec.NumberOfTotalDocs += int64(len(engine.Documents))
 	}
 
+	fmt.Println("TotalDocs:", sec.NumberOfTotalDocs)
 	return nil
 }
 
@@ -138,9 +139,9 @@ func (sec *SearchEngineController) SaveAllShards(indexName string) error {
 // Index distributes documents evenly across all shards and runs Index() in parallel.
 // Documents slice is chunked by ceil(len/docs / shardCount), and each goroutine
 // indexes its segment, then waits for all to complete.
-func (sec *SearchEngineController) Index(docs []map[string]interface{}) {
+func (sec *SearchEngineController) Index2(docs []map[string]interface{}) {
 	sec.mu.Lock()
-	sec.NumberOfTotalDocs += len(docs)
+	sec.NumberOfTotalDocs += int64(len(docs))
 	sec.mu.Unlock()
 	chunkSize := (len(docs) + sec.SearchEngineCount - 1) / sec.SearchEngineCount
 
@@ -167,10 +168,41 @@ func (sec *SearchEngineController) Index(docs []map[string]interface{}) {
 	wg.Wait()
 }
 
+func (sec *SearchEngineController) Index(docs []map[string]interface{}) {
+	// Update total docs count
+	sec.mu.Lock()
+	sec.NumberOfTotalDocs += int64(len(docs))
+	sec.mu.Unlock()
+
+	// Prepare shards in round-robin fashion
+	shards := make([][]map[string]interface{}, sec.SearchEngineCount)
+	// start := time.Now()
+	for i, doc := range docs {
+		shardIdx := i % sec.SearchEngineCount
+		shards[shardIdx] = append(shards[shardIdx], doc)
+	}
+	// duration := time.Since(start)
+	// fmt.Printf("Index2 for loop took: %s\n", duration)
+
+	var wg sync.WaitGroup
+	// Launch indexing for each shard
+	for engineIdx, shardDocs := range shards {
+		if len(shardDocs) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(idx int, items []map[string]interface{}) {
+			defer wg.Done()
+			sec.Engines[idx].Index(idx, items)
+		}(engineIdx, shardDocs)
+	}
+
+	wg.Wait()
+}
+
 // Search executes the query on all shards in parallel, then merges results.
 // Parameters: query string, page number, and filter map. Returns sorted Documents.
 func (sec *SearchEngineController) Search(query string, page int, filters map[string][]interface{}) []Document {
-	fmt.Println("FIRST SEARCH")
 	resultsChan := make(chan *SearchResult, sec.SearchEngineCount)
 	var wg sync.WaitGroup
 
@@ -178,8 +210,7 @@ func (sec *SearchEngineController) Search(query string, page int, filters map[st
 		wg.Add(1)
 		go func(e *SearchEngine) {
 			defer wg.Done()
-			// TODO: magic number, make it configurative
-			result := e.Search(query, page, filters, 5)
+			result := e.Search(query, page, filters)
 			resultsChan <- result
 		}(se)
 	}
@@ -188,87 +219,16 @@ func (sec *SearchEngineController) Search(query string, page int, filters map[st
 
 	res := CombineResults(resultsChan)
 
-	sec.mu.RLock()
-	totalDocs := sec.NumberOfTotalDocs
-	sec.mu.RUnlock()
-
-	// If the entire index is small (fewer than 1,000 documents), it’s unlikely
-	// that any search will be missing results due to prefix limitations.
-	// In that case, we can return whatever we found immediately without
-	// attempting longer prefix searches.
-	// TODO: magic number, make it configurative
-	if totalDocs < 1_000 {
-		if res != nil {
-			return res.Docs
-		}
-		return nil
-	}
-
-	// In the initial search, we used a maximum prefix length of 5.
-	// If the merged results are fewer than 4 documents AND they were obtained
-	// using that prefix length (IsPrefix == true and MaxPrefixLength == 5),
-	// it means we might have missed matches that require a longer prefix.
-	// Therefore, we perform a second search with a larger prefix length (1000).
-	// If that still yields too few results (and MaxPrefixLength == 1000),
-	// we fall back to an even larger prefix length (8000) in a third attempt.
-	// TODO: magic number, make it configurative
-	if res == nil || (len(res.Docs) < 4 && res.IsPrefix && res.MaxPrefixLength == 5) {
-		fmt.Println("SECOND SEARCH")
-		resultsChan := make(chan *SearchResult, sec.SearchEngineCount)
-		var wg sync.WaitGroup
-
-		for _, se := range sec.Engines {
-			wg.Add(1)
-			go func(e *SearchEngine) {
-				defer wg.Done()
-				// TODO: magic number, make it configurative
-				result := e.Search(query, page, filters, 1000)
-				fmt.Println("-----")
-				fmt.Println("SHARDID", se.ShardID)
-				for _, doc := range result.Docs {
-					fmt.Printf("ID:%s - Score:%d\n", doc.ID, doc.ScoreWeight)
-				}
-				fmt.Println("-----")
-				resultsChan <- result
-			}(se)
-		}
-		wg.Wait()
-		close(resultsChan)
-
-		res = CombineResults(resultsChan)
-
-		// TODO: magic number, make it configurative
-		if res == nil || (len(res.Docs) < 4 && res.MaxPrefixLength == 1000) {
-			fmt.Println("THIRD SEARCH")
-			resultsChan := make(chan *SearchResult, sec.SearchEngineCount)
-			var wg sync.WaitGroup
-
-			for _, se := range sec.Engines {
-				wg.Add(1)
-				go func(e *SearchEngine) {
-					defer wg.Done()
-					// TODO: magic number, make it configurative
-					result := e.Search(query, page, filters, 8000)
-					resultsChan <- result
-				}(se)
-			}
-			wg.Wait()
-			close(resultsChan)
-
-			res = CombineResults(resultsChan)
-		}
-	}
-
 	if res == nil {
 		return []Document{}
 	}
 	return res.Docs
 }
 
-// CombineResults merges shard SearchResults by priority: multi-term, exact, prefix, then fuzzy.
+// CombineResults merges shard SearchResults by priority: multi-term, prefixOrExact, then fuzzy.
 // It collects docs into the first non-empty category, sorts by ScoreWeight desc, and returns.
 func CombineResults(resultsChan <-chan *SearchResult) *CombinedResponse {
-	var multi, exact, prefix, fuzzy []Document
+	var multi, prefix, fuzzy []Document
 
 	isPrefix := false
 	maxPrefixLength := 0
@@ -283,9 +243,7 @@ func CombineResults(resultsChan <-chan *SearchResult) *CombinedResponse {
 				maxPrefixLength = res.PrefixLength
 			}
 			multi = append(multi, res.Docs...)
-		case res.IsExact:
-			exact = append(exact, res.Docs...)
-		case res.IsPrefix:
+		case res.IsPrefixOrExact:
 			isPrefix = true
 			if res.PrefixLength > maxPrefixLength {
 				maxPrefixLength = res.PrefixLength
@@ -299,8 +257,6 @@ func CombineResults(resultsChan <-chan *SearchResult) *CombinedResponse {
 	switch {
 	case len(multi) > 0:
 		returnResult = multi
-	case len(exact) > 0:
-		returnResult = exact
 	case len(prefix) > 0:
 		returnResult = prefix
 	case len(fuzzy) > 0:

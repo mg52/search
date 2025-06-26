@@ -185,3 +185,87 @@ func TestTrie_Update_NewKeyInserted(t *testing.T) {
 		t.Errorf("SearchPrefix(ban) = %v; want [banana]", rst2)
 	}
 }
+
+func TestFuzzySearch(t *testing.T) {
+	// Build a trie with some sample words
+	trie := NewTrie()
+	words := []string{"black", "block", "back", "blacks", "slack", "flack"}
+	for _, w := range words {
+		trie.Insert(w)
+	}
+
+	tests := []struct {
+		name       string
+		query      string
+		maxDist    int
+		maxResults int
+		want       []string
+	}{
+		{
+			name:       "ExactMatch",
+			query:      "black",
+			maxDist:    1,
+			maxResults: 10,
+			want:       []string{"black"},
+		},
+		{
+			name:       "Substitution",
+			query:      "blacj",
+			maxDist:    1,
+			maxResults: 10,
+			want:       []string{"black"},
+		},
+		{
+			name:       "Insertion",
+			query:      "blackk",
+			maxDist:    1,
+			maxResults: 10,
+			want:       []string{"black"},
+		},
+		{
+			name:       "Deletion",
+			query:      "blac",
+			maxDist:    1,
+			maxResults: 10,
+			want:       []string{"black"},
+		},
+		{
+			name:       "NoMatch",
+			query:      "xyz",
+			maxDist:    1,
+			maxResults: 10,
+			want:       []string{},
+		},
+		{
+			name:       "LimitResults",
+			query:      "bck",
+			maxDist:    1,
+			maxResults: 10,
+			want:       []string{"back"},
+		},
+		{
+			name:       "MultiMatch",
+			query:      "bleck",
+			maxDist:    1,
+			maxResults: 10,
+			want:       []string{"black", "block"},
+		},
+		{
+			name:       "FirstCharFail",
+			query:      "vlock",
+			maxDist:    1,
+			maxResults: 10,
+			want:       []string{"block"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := trie.FuzzySearch(tc.query, tc.maxDist, tc.maxResults)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("FuzzySearch(%q, %d, %d) = %v; want %v",
+					tc.query, tc.maxDist, tc.maxResults, got, tc.want)
+			}
+		})
+	}
+}
