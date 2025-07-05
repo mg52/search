@@ -24,7 +24,7 @@ func TestOneTermSearchWithFilter(t *testing.T) {
 
 	filter := make(map[string][]interface{})
 	filter["year"] = append(filter["year"], 2015)
-	result := sec.Search("optimal", 0, filter)
+	result := sec.Search("optimal", 0, filter, 0)
 
 	if len(result) != 4 {
 		t.Errorf("Expected search result is 4, got %d", len(result))
@@ -59,7 +59,7 @@ func TestOneTermSearchWithoutFilter(t *testing.T) {
 	sec.Index(docs)
 
 	filter := make(map[string][]interface{})
-	result := sec.Search("optimal", 0, filter)
+	result := sec.Search("optimal", 0, filter, 0)
 
 	if len(result) != 7 {
 		t.Errorf("Expected search result is 7, got %d", len(result))
@@ -123,7 +123,7 @@ func TestUpdateDocument(t *testing.T) {
 	filter["year"] = append(filter["year"], 2015)
 
 	// Search before updating
-	result := sec.Search("optimal", 0, filter)
+	result := sec.Search("optimal", 0, filter, 0)
 
 	if len(result) != 4 {
 		t.Errorf("Expected search result is 4, got %d", len(result))
@@ -157,7 +157,7 @@ func TestUpdateDocument(t *testing.T) {
 
 	// Search after removing
 	filter["year"] = append(filter["year"], 2015)
-	result = sec.Search("optimal", 0, filter)
+	result = sec.Search("optimal", 0, filter, 0)
 
 	if len(result) != 4 {
 		t.Errorf("Expected search result is 4, got %d", len(result))
@@ -202,7 +202,7 @@ func TestAddDocumentToFreshIndex(t *testing.T) {
 	}
 	sec.AddOrUpdateDocument(doc2)
 
-	result := sec.Search("afford", 0, nil)
+	result := sec.Search("afford", 0, nil, 0)
 
 	if len(result) != 2 {
 		t.Errorf("Expected search result is 2, got %d", len(result))
@@ -236,13 +236,13 @@ func TestSearchEngineControllerFlow(t *testing.T) {
 	emptyFilters := make(map[string][]interface{})
 
 	// 1) Search "kalemi" before update → expect no results
-	res := sec.Search("kalemi", 0, emptyFilters)
+	res := sec.Search("kalemi", 0, emptyFilters, 0)
 	if len(res) != 0 {
 		t.Errorf("expected 0 results for 'kalemi' before update, got %d: %#v", len(res), res)
 	}
 
 	// 2) Search "afford" before update → length and map-based check
-	res = sec.Search("afford", 0, emptyFilters)
+	res = sec.Search("afford", 0, emptyFilters, 0)
 	if len(res) != 7 {
 		t.Fatalf("expected 7 results for 'afford' before update, got %d", len(res))
 	}
@@ -281,7 +281,7 @@ func TestSearchEngineControllerFlow(t *testing.T) {
 	sec.AddOrUpdateDocument(updatedDoc)
 
 	// 4) Search "afford" after update → length and map-based check
-	res = sec.Search("afford", 0, emptyFilters)
+	res = sec.Search("afford", 0, emptyFilters, 0)
 	if len(res) != 7 {
 		t.Fatalf("expected 7 results for 'afford' after update, got %d", len(res))
 	}
@@ -310,7 +310,7 @@ func TestSearchEngineControllerFlow(t *testing.T) {
 	}
 
 	// 5) Search "kalemi" after update → expect exactly one result
-	res = sec.Search("kalemi", 0, emptyFilters)
+	res = sec.Search("kalemi", 0, emptyFilters, 0)
 	if len(res) != 1 {
 		t.Fatalf("expected 1 result for 'kalemi' after update, got %d", len(res))
 	}
@@ -337,7 +337,7 @@ func TestSearchEngineControllerFlow_Pagination(t *testing.T) {
 
 	emptyFilters := make(map[string][]interface{})
 
-	result := sec.Search("optimal afford", 0, emptyFilters)
+	result := sec.Search("optimal afford", 0, emptyFilters, 0)
 	if len(result) != 2 {
 		t.Errorf("expected 2 results for 'optimal afford', got %d: %#v", len(result), result)
 	}
@@ -350,7 +350,7 @@ func TestSearchEngineControllerFlow_Pagination(t *testing.T) {
 			result[1].ID, result[1].ScoreWeight)
 	}
 
-	result = sec.Search("optimal afford", 1, emptyFilters)
+	result = sec.Search("optimal afford", 1, emptyFilters, 0)
 	if len(result) != 2 {
 		t.Errorf("expected 2 results for 'optimal afford', got %d: %#v", len(result), result)
 	}
@@ -363,7 +363,7 @@ func TestSearchEngineControllerFlow_Pagination(t *testing.T) {
 			result[1].ID, result[1].ScoreWeight)
 	}
 
-	result = sec.Search("optimal afford", 2, emptyFilters)
+	result = sec.Search("optimal afford", 2, emptyFilters, 0)
 	if len(result) != 1 {
 		t.Errorf("expected 1 results for 'optimal afford', got %d: %#v", len(result), result)
 	}

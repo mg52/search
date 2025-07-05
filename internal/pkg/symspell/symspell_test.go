@@ -40,7 +40,7 @@ func TestSymSpell_FuzzySearch(t *testing.T) {
 		{
 			name:  "NoMatch",
 			query: "xyz",
-			want:  nil,
+			want:  []string{},
 		},
 	}
 
@@ -69,7 +69,7 @@ func TestAddWord_Idempotent(t *testing.T) {
 func TestEmptyDictionary(t *testing.T) {
 	ss := NewSymSpell()
 	got := ss.FuzzySearch("anything", 5)
-	if got != nil {
+	if len(got) != 0 {
 		t.Errorf("Empty dictionary: FuzzySearch should return empty slice, got %v", got)
 	}
 }

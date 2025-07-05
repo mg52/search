@@ -26,9 +26,8 @@ type SearchEngineController struct {
 // and carries metadata about whether any of the returned results came from a prefix-based search
 // along with the maximum prefix length encountered during merging.
 type CombinedResponse struct {
-	Docs            []Document // The final list of documents, sorted by descending ScoreWeight.
-	IsPrefix        bool       // True if any of the merged results originated from a prefix or multi-term query.
-	MaxPrefixLength int        // The largest prefix length encountered among all prefix-based results.
+	Docs        []Document // The final list of documents, sorted by descending ScoreWeight.
+	IsMultiTerm bool       // True if the search is performed for multi term search.
 }
 
 // NewSearchEngineController constructs a controller with the given configuration.
@@ -176,16 +175,12 @@ func (sec *SearchEngineController) Index(docs []map[string]interface{}) {
 
 	// Prepare shards in round-robin fashion
 	shards := make([][]map[string]interface{}, sec.SearchEngineCount)
-	// start := time.Now()
 	for i, doc := range docs {
 		shardIdx := i % sec.SearchEngineCount
 		shards[shardIdx] = append(shards[shardIdx], doc)
 	}
-	// duration := time.Since(start)
-	// fmt.Printf("Index2 for loop took: %s\n", duration)
 
 	var wg sync.WaitGroup
-	// Launch indexing for each shard
 	for engineIdx, shardDocs := range shards {
 		if len(shardDocs) == 0 {
 			continue
@@ -202,7 +197,7 @@ func (sec *SearchEngineController) Index(docs []map[string]interface{}) {
 
 // Search executes the query on all shards in parallel, then merges results.
 // Parameters: query string, page number, and filter map. Returns sorted Documents.
-func (sec *SearchEngineController) Search(query string, page int, filters map[string][]interface{}) []Document {
+func (sec *SearchEngineController) Search(query string, page int, filters map[string][]interface{}, searchStep int) []Document {
 	resultsChan := make(chan *SearchResult, sec.SearchEngineCount)
 	var wg sync.WaitGroup
 
@@ -210,7 +205,7 @@ func (sec *SearchEngineController) Search(query string, page int, filters map[st
 		wg.Add(1)
 		go func(e *SearchEngine) {
 			defer wg.Done()
-			result := e.Search(query, page, filters)
+			result := e.Search(query, page, filters, searchStep)
 			resultsChan <- result
 		}(se)
 	}
@@ -218,9 +213,13 @@ func (sec *SearchEngineController) Search(query string, page int, filters map[st
 	close(resultsChan)
 
 	res := CombineResults(resultsChan)
-
 	if res == nil {
 		return []Document{}
+	} else {
+		if len(res.Docs) == 0 && searchStep < 2 && res.IsMultiTerm {
+			// fmt.Println("sec.Search", searchStep)
+			return sec.Search(query, page, filters, searchStep+1)
+		}
 	}
 	return res.Docs
 }
@@ -230,24 +229,16 @@ func (sec *SearchEngineController) Search(query string, page int, filters map[st
 func CombineResults(resultsChan <-chan *SearchResult) *CombinedResponse {
 	var multi, prefix, fuzzy []Document
 
-	isPrefix := false
-	maxPrefixLength := 0
+	isMultiTerm := false
 	for res := range resultsChan {
 		if res == nil {
 			continue
 		}
+		isMultiTerm = res.IsMultiTerm
 		switch {
 		case res.IsMultiTerm:
-			isPrefix = true
-			if res.PrefixLength > maxPrefixLength {
-				maxPrefixLength = res.PrefixLength
-			}
 			multi = append(multi, res.Docs...)
 		case res.IsPrefixOrExact:
-			isPrefix = true
-			if res.PrefixLength > maxPrefixLength {
-				maxPrefixLength = res.PrefixLength
-			}
 			prefix = append(prefix, res.Docs...)
 		case res.IsFuzzy:
 			fuzzy = append(fuzzy, res.Docs...)
@@ -263,9 +254,8 @@ func CombineResults(resultsChan <-chan *SearchResult) *CombinedResponse {
 		returnResult = fuzzy
 	default:
 		resp := CombinedResponse{
-			Docs:            returnResult,
-			IsPrefix:        isPrefix,
-			MaxPrefixLength: maxPrefixLength,
+			Docs:        returnResult,
+			IsMultiTerm: isMultiTerm,
 		}
 		return &resp
 	}
@@ -275,9 +265,8 @@ func CombineResults(resultsChan <-chan *SearchResult) *CombinedResponse {
 	})
 
 	resp := CombinedResponse{
-		Docs:            returnResult,
-		IsPrefix:        isPrefix,
-		MaxPrefixLength: maxPrefixLength,
+		Docs:        returnResult,
+		IsMultiTerm: isMultiTerm,
 	}
 	return &resp
 }

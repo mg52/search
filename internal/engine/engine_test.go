@@ -434,72 +434,35 @@ func TestSearchOneTermWithFilter(t *testing.T) {
 	}
 }
 
-func TestSearchMultipleTermsWithoutFilter_WithoutIndexing(t *testing.T) {
-	engine := buildTestEngine(t)
-	// multi-term: exact matches ["apple","date"] → only doc3 has date but not apple; doc1 has apple but not date → none
-	queries := map[string][]string{
-		"exact":  {"apple"},
-		"prefix": {"date"},
-		"fuzzy":  nil,
-		"raw":    {"apple", "date"},
-	}
-	res := engine.SearchMultipleTermsWithoutFilter(queries, 0)
-	if len(res) != 0 {
-		t.Errorf("expected no docs, got %v", res)
-	}
-	// two terms ["banana","cherry"] → doc2 matches both
-	// queries["exact"] = []string{"banana", "cherry"}
-	queries = map[string][]string{
-		"exact":  {"banana"},
-		"prefix": {"cherry"},
-		"fuzzy":  nil,
-		"raw":    {"banana", "cherry"},
-	}
-	res = engine.SearchMultipleTermsWithoutFilter(queries, 0)
-	if len(res) != 1 || res[0].ID != "2" {
-		t.Errorf("expected doc2, got %v", res)
-	}
-}
-
-func TestSearchMultipleTermsWithFilter(t *testing.T) {
-	engine := buildTestEngine(t)
-	// multi-term with filter year=2020: exact ["apple","banana"] only doc1
-	queries := map[string][]string{"exact": {"apple"}, "prefix": {"banana"}, "fuzzy": nil, "raw": {"apple", "banana"}}
-	res := engine.SearchMultipleTermsWithFilter(queries, map[string][]interface{}{"year": {2020}}, 0)
-	if len(res) != 1 || res[0].ID != "1" {
-		t.Errorf("expected doc1, got %v", res)
-	}
-}
-
 func TestEndToEnd_Search(t *testing.T) {
 	engine := buildTestEngine(t)
 
 	// exact one term
-	sr := engine.Search("apple", 0, nil)
+	sr := engine.Search("apple", 0, nil, 0)
 	if sr == nil || !sr.IsPrefixOrExact || len(sr.Docs) != 1 || sr.Docs[0].ID != "1" {
 		t.Errorf("Search apple exact failed: %+v", sr)
 	}
 
 	// prefix
-	sr = engine.Search("cher", 0, nil)
+	sr = engine.Search("cher", 0, nil, 0)
 	if sr == nil || !sr.IsPrefixOrExact || len(sr.Docs) != 2 {
 		t.Errorf("Search cher prefix failed: %+v", sr)
 	}
 
 	// fuzzy ("aple" -> apple)
-	sr = engine.Search("aple", 0, nil)
+	sr = engine.Search("aple", 0, nil, 0)
 	if sr == nil || !sr.IsFuzzy || len(sr.Docs) != 1 || sr.Docs[0].ID != "1" {
 		t.Errorf("Search aple fuzzy failed: %+v", sr)
 	}
 
 	// multi-term
-	sr = engine.Search("banana cherry", 0, nil)
+	sr = engine.Search("banana cherry", 0, nil, 0)
 	if sr == nil || !sr.IsMultiTerm || len(sr.Docs) != 1 || sr.Docs[0].ID != "2" {
 		t.Errorf("Search multi failed: %+v", sr)
 	}
 
 	// with filter
-	sr = engine.Search("banana", 0, map[string][]interface{}{"year": {2020}})
+	sr = engine.Search("banana", 0, map[string][]interface{}{"year": {2020}}, 0)
 	if sr == nil || !sr.IsPrefixOrExact || len(sr.Docs) != 1 || sr.Docs[0].ID != "1" {
 		t.Errorf("Search banana with filter failed: %+v", sr)
 	}
@@ -514,7 +477,7 @@ func TestAddAndRemoveDocument(t *testing.T) {
 		t.Fatal("addDocument did not insert doc4")
 	}
 	// ensure searchable
-	sr := engine.Search("egg", 0, nil)
+	sr := engine.Search("egg", 0, nil, 0)
 	if sr == nil || sr.Docs[0].ID != "4" {
 		t.Errorf("Search egg after add failed: %+v", sr)
 	}
@@ -524,7 +487,7 @@ func TestAddAndRemoveDocument(t *testing.T) {
 	if _, ok := engine.Documents["4"]; ok {
 		t.Error("removeDocumentByID did not delete doc4")
 	}
-	sr = engine.Search("egg", 0, nil)
+	sr = engine.Search("egg", 0, nil, 0)
 	// Accept either no SearchResult or an empty Docs slice
 	if sr != nil && len(sr.Docs) != 0 {
 		t.Errorf("expected no results after remove, got %+v", sr)
@@ -540,7 +503,7 @@ func TestAddAndRemoveDocument_ExistingString(t *testing.T) {
 		t.Fatal("addDocument did not insert doc4")
 	}
 	// ensure searchable
-	sr := engine.Search("banana", 0, nil)
+	sr := engine.Search("banana", 0, nil, 0)
 	if sr == nil || sr.Docs[0].ID != "4" || sr.Docs[0].ScoreWeight != 50000 {
 		t.Errorf("Search banana after add failed: %+v", sr)
 	}
@@ -550,7 +513,7 @@ func TestAddAndRemoveDocument_ExistingString(t *testing.T) {
 	if _, ok := engine.Documents["4"]; ok {
 		t.Error("removeDocumentByID did not delete doc4")
 	}
-	sr = engine.Search("banana", 0, nil)
+	sr = engine.Search("banana", 0, nil, 0)
 	if !((sr.Docs[0].ID == "1" || sr.Docs[0].ID == "2") && sr.Docs[0].ScoreWeight == 33333) {
 		t.Errorf("expected DocID 1 or 2 after removing banana, got %+v", sr)
 	}
@@ -733,7 +696,7 @@ func TestSearchEngineFlow_MultiTerm_LastTermLessThan2(t *testing.T) {
 	emptyFilters := make(map[string][]interface{})
 
 	// map[exact:[smart] prefix:[crop clay cream compact] raw:[smart c]]
-	result := engine.Search("smart c", 0, emptyFilters)
+	result := engine.Search("smart c", 0, emptyFilters, 0)
 	resultDocs := result.Docs
 
 	sort.Slice(resultDocs, func(i, j int) bool {
@@ -765,7 +728,7 @@ func TestSearchEngineFlow_MultiTerm_LastTermLessThan2(t *testing.T) {
 		t.Errorf("for 'smart c', expected {ID:\"28, 2, 22\",ScoreWeight:66666}, got %s - %d", resultDocs[4].ID, resultDocs[4].ScoreWeight)
 	}
 
-	result = engine.Search("smart c", 1, emptyFilters)
+	result = engine.Search("smart c", 1, emptyFilters, 0)
 	resultDocs = result.Docs
 
 	sort.Slice(resultDocs, func(i, j int) bool {
@@ -803,7 +766,7 @@ func TestSearchEngineFlow_MultiTerm_LastTermLessThan2(t *testing.T) {
 		t.Errorf("for 'smart c', expected {ID:\"26\",ScoreWeight:40000}, got %s - %d", resultDocs[4].ID, resultDocs[4].ScoreWeight)
 	}
 
-	result = engine.Search("smart c", 2, emptyFilters)
+	result = engine.Search("smart c", 2, emptyFilters, 0)
 	resultDocs = result.Docs
 
 	if len(resultDocs) != 2 {

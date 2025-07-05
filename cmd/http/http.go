@@ -118,7 +118,7 @@ func (ht *HTTP) Search(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	result := sec.Search(query, pageInt, filters)
+	result := sec.Search(query, pageInt, filters, 0)
 	duration := time.Since(startTime)
 	// fmt.Printf("Search [%s] took %s for query %q\n", indexName, duration, query)
 
