@@ -123,12 +123,13 @@ func (ht *HTTP) Search(w http.ResponseWriter, r *http.Request) {
 	// fmt.Printf("Search [%s] took %s for query %q\n", indexName, duration, query)
 
 	resp := map[string]interface{}{
-		"status":     "success",
-		"statusCode": 200,
-		"index":      indexName,
-		"query":      query,
-		"response":   result,
-		"duration":   duration.String(),
+		"status":       "success",
+		"statusCode":   200,
+		"index":        indexName,
+		"query":        query,
+		"response":     result,
+		"duration":     duration,
+		"durationInMs": duration.Milliseconds(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

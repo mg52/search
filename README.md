@@ -67,10 +67,12 @@ This engine uses two primary in-memory structures to enable fast, score-based se
    * After indexing completes, we call `BuildScoreIndex()`. For each term, this method collects all `(docID, weight)` pairs from `Data[term]`, sorts them in descending order by weight, and stores the result as `ScoreIndex[term]`.
    * Because `ScoreIndex[term]` is already sorted, a single-term lookup is extremely fast: to retrieve page 0 of “book,” the engine simply returns `ScoreIndex["book"][0:PageSize]` (which is O(1) to look up and O(PageSize) to copy).
 
-#### 3. **Keys and Trie**
+#### 3. **Keys, Trie and SymSpell**
 
-   * During indexing, every unique token is also added to a `Keys` map (for quick existence checks) and inserted into a `Trie` (for prefix lookups).
-   * The trie supports up to 5 prefix completions, and `Keys` is used for fuzzy matching (Levenshtein distance ≤ 2) when no exact or prefix match is found.
+   * During indexing, every unique token is also added to a `Keys` map (for quick existence checks) and inserted into a `Trie` (for prefix lookups) and inserted into `SymSpell`.
+   * `Keys` is used for checking exact matching. 
+   * `Trie` is for keeping all prefix candidates of given string.
+   * `SymSpell` is for keeping all keys' fuzzy matchings (Levenshtein distance ≤ 1)
 
 ---
 
@@ -119,7 +121,7 @@ Assume we have indexed these two documents (indexing only the `"name"` and `"tag
    ```
 
    in descending weight order.
-   If “book” were not in the `Keys` map, the engine would attempt a fuzzy match (edit distance ≤ 2).
+   If “book” were not in the `Keys` map, the engine would attempt a fuzzy match (edit distance ≤ 1).
 
 ---
 
@@ -130,7 +132,9 @@ Now search for `"affordable book"`:
 #### 1. **Resolve Tokens**
 
    * The first token (“affordable”) is treated as an exact match if it exists in `Keys`.
-   * The last token (“book”) is treated as a prefix query (i.e. `Trie.SearchPrefix("book")`), returning up to 5 completions (in the first search) such as `["book","booking","booked"]`. If there is no data within 5 prefix search, it makes a second search with 1000 prefix completions.
+   * The last token (“book”) is treated as a prefix query (i.e. `Trie.SearchPrefix("book")`), returning up to 1000 completions such as `["book","booking","booked"]`. 
+   * If there is no data within 1000 prefix search, it makes a second search for guessing first token in the SymSpell with levenshtein distance of 1.
+   * If there is no data again, it makes a third search for the only first token which is guessed using SymSpell.
 
 #### 2. **Primary Posting List**
 
