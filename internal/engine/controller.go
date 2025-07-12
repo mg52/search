@@ -138,35 +138,6 @@ func (sec *SearchEngineController) SaveAllShards(indexName string) error {
 // Index distributes documents evenly across all shards and runs Index() in parallel.
 // Documents slice is chunked by ceil(len/docs / shardCount), and each goroutine
 // indexes its segment, then waits for all to complete.
-func (sec *SearchEngineController) Index2(docs []map[string]interface{}) {
-	sec.mu.Lock()
-	sec.NumberOfTotalDocs += int64(len(docs))
-	sec.mu.Unlock()
-	chunkSize := (len(docs) + sec.SearchEngineCount - 1) / sec.SearchEngineCount
-
-	var wg sync.WaitGroup
-
-	for i := 0; i < sec.SearchEngineCount; i++ {
-		dataStart := chunkSize * i
-		if dataStart >= len(docs) {
-			break
-		}
-		dataEnd := dataStart + chunkSize
-		if dataEnd > len(docs) {
-			dataEnd = len(docs)
-		}
-
-		wg.Add(1)
-
-		go func(engineIdx, start, end int) {
-			defer wg.Done()
-			sec.Engines[engineIdx].Index(engineIdx, docs[start:end])
-		}(i, dataStart, dataEnd)
-	}
-
-	wg.Wait()
-}
-
 func (sec *SearchEngineController) Index(docs []map[string]interface{}) {
 	// Update total docs count
 	sec.mu.Lock()
@@ -217,7 +188,9 @@ func (sec *SearchEngineController) Search(query string, page int, filters map[st
 		return []Document{}
 	} else {
 		if len(res.Docs) == 0 && searchStep < 2 && res.IsMultiTerm {
-			// fmt.Println("sec.Search", searchStep)
+			// second and third search:
+			// if no result with multiple search, go with second and third search
+			// with more detailed fuzzy searches for the terms.
 			return sec.Search(query, page, filters, searchStep+1)
 		}
 	}
