@@ -619,65 +619,77 @@ func (se *SearchEngine) Search(query string, page int, filters map[string][]inte
 	if len(queryTokens) == 0 {
 		return nil
 	} else if len(queryTokens) == 1 {
-		parsedQuery := make(map[string][]string)
-		guessArr := se.Trie.SearchPrefix(queryTokens[0], 3)
-		if guessArr != nil {
-			parsedQuery["prefix"] = append(parsedQuery["prefix"], guessArr...)
+		return se.SingleTermSearch(queryTokens, page, filters, searchStep)
+	} else {
+		return se.MultiTermSearch(queryTokens, page, filters, searchStep)
+	}
+}
+
+func (se *SearchEngine) SingleTermSearch(queryTokens []string, page int, filters map[string][]interface{}, searchStep int) *SearchResult {
+	parsedQuery := make(map[string][]string)
+	guessArr := se.Trie.SearchPrefix(queryTokens[0], 3)
+	if guessArr != nil {
+		parsedQuery["prefix"] = append(parsedQuery["prefix"], guessArr...)
+	} else {
+		fuzzyWords := se.Symspell.FuzzySearch(queryTokens[0], 3)
+		if len(fuzzyWords) > 0 {
+			parsedQuery["fuzzy"] = append(parsedQuery["fuzzy"], fuzzyWords...)
 		} else {
-			fuzzyWords := se.Symspell.FuzzySearch(queryTokens[0], 3)
-			if len(fuzzyWords) > 0 {
-				parsedQuery["fuzzy"] = append(parsedQuery["fuzzy"], fuzzyWords...)
-			} else {
-				parsedQuery["fuzzy"] = append(parsedQuery["fuzzy"], queryTokens[0])
-			}
+			parsedQuery["fuzzy"] = append(parsedQuery["fuzzy"], queryTokens[0])
 		}
-		var finalDocs []Document
-		if len(filters) == 0 {
-			if parsedQuery["prefix"] != nil {
-				for _, query := range parsedQuery["prefix"] {
-					finalDocs = append(finalDocs, se.SearchOneTermWithoutFilter(query, page)...)
-				}
-				return &SearchResult{
-					Docs:            finalDocs,
-					IsMultiTerm:     false,
-					IsFuzzy:         false,
-					IsPrefixOrExact: true,
-				}
-			} else if parsedQuery["fuzzy"] != nil {
-				for _, query := range parsedQuery["fuzzy"] {
-					finalDocs = append(finalDocs, se.SearchOneTermWithoutFilter(query, page)...)
-				}
-				return &SearchResult{
-					Docs:            finalDocs,
-					IsMultiTerm:     false,
-					IsFuzzy:         true,
-					IsPrefixOrExact: false,
-				}
+	}
+	var finalDocs []Document
+	if len(filters) == 0 {
+		if parsedQuery["prefix"] != nil {
+			for _, query := range parsedQuery["prefix"] {
+				finalDocs = append(finalDocs, se.SearchOneTermWithoutFilter(query, page)...)
 			}
-		} else {
-			if parsedQuery["prefix"] != nil {
-				for _, query := range parsedQuery["prefix"] {
-					finalDocs = append(finalDocs, se.SearchOneTermWithFilter(query, filters, page)...)
-				}
-				return &SearchResult{
-					Docs:            finalDocs,
-					IsMultiTerm:     false,
-					IsFuzzy:         false,
-					IsPrefixOrExact: true,
-				}
-			} else if parsedQuery["fuzzy"] != nil {
-				for _, query := range parsedQuery["fuzzy"] {
-					finalDocs = append(finalDocs, se.SearchOneTermWithFilter(query, filters, page)...)
-				}
-				return &SearchResult{
-					Docs:            finalDocs,
-					IsMultiTerm:     false,
-					IsFuzzy:         true,
-					IsPrefixOrExact: false,
-				}
+			return &SearchResult{
+				Docs:            finalDocs,
+				IsMultiTerm:     false,
+				IsFuzzy:         false,
+				IsPrefixOrExact: true,
+			}
+		} else if parsedQuery["fuzzy"] != nil {
+			for _, query := range parsedQuery["fuzzy"] {
+				finalDocs = append(finalDocs, se.SearchOneTermWithoutFilter(query, page)...)
+			}
+			return &SearchResult{
+				Docs:            finalDocs,
+				IsMultiTerm:     false,
+				IsFuzzy:         true,
+				IsPrefixOrExact: false,
 			}
 		}
 	} else {
+		if parsedQuery["prefix"] != nil {
+			for _, query := range parsedQuery["prefix"] {
+				finalDocs = append(finalDocs, se.SearchOneTermWithFilter(query, filters, page)...)
+			}
+			return &SearchResult{
+				Docs:            finalDocs,
+				IsMultiTerm:     false,
+				IsFuzzy:         false,
+				IsPrefixOrExact: true,
+			}
+		} else if parsedQuery["fuzzy"] != nil {
+			for _, query := range parsedQuery["fuzzy"] {
+				finalDocs = append(finalDocs, se.SearchOneTermWithFilter(query, filters, page)...)
+			}
+			return &SearchResult{
+				Docs:            finalDocs,
+				IsMultiTerm:     false,
+				IsFuzzy:         true,
+				IsPrefixOrExact: false,
+			}
+		}
+	}
+	return nil
+}
+
+func (se *SearchEngine) MultiTermSearch(queryTokens []string, page int, filters map[string][]interface{}, searchStep int) *SearchResult {
+	if searchStep == 0 {
+		// first search: first term is exact or first fuzzy term. e.g., search for "iron maiden"
 		var lastTermGuessArr []string
 		lastTerm := ""
 		if len(queryTokens[len(queryTokens)-1]) <= 3 {
@@ -685,76 +697,79 @@ func (se *SearchEngine) Search(query string, page int, filters map[string][]inte
 		} else {
 			lastTermGuessArr = se.Trie.SearchPrefix(queryTokens[len(queryTokens)-1], 250)
 		}
-		// first search: first term is exact or first fuzzy term. e.g., search for "iron maiden"
-		if searchStep == 0 {
-			var firstTerms []string
-			for _, firstTerm := range queryTokens[:len(queryTokens)-1] {
-				_, ok := se.Keys.GetData()[firstTerm]
-				if ok {
-					firstTerms = append(firstTerms, firstTerm)
+		var firstTerms []string
+		for _, firstTerm := range queryTokens[:len(queryTokens)-1] {
+			_, ok := se.Keys.GetData()[firstTerm]
+			if ok {
+				firstTerms = append(firstTerms, firstTerm)
+			} else {
+				fuzzyWords := se.Symspell.FuzzySearch(firstTerm, 1)
+				if len(fuzzyWords) > 0 {
+					firstTerms = append(firstTerms, fuzzyWords[0])
 				} else {
-					fuzzyWords := se.Symspell.FuzzySearch(firstTerm, 1)
-					if len(fuzzyWords) > 0 {
-						firstTerms = append(firstTerms, fuzzyWords[0])
-					} else {
-						firstTerms = append(firstTerms, firstTerm)
-					}
-				}
-			}
-			finalDocs := se.SearchMultipleTerms(firstTerms, lastTerm, lastTermGuessArr, filters, page)
-			return &SearchResult{
-				Docs:            finalDocs,
-				IsMultiTerm:     true,
-				IsFuzzy:         false,
-				IsPrefixOrExact: false,
-			}
-		} else if searchStep == 1 {
-			// second search: first term is an array of fuzzies.
-			// e.g., search for "irom maiden"
-			// check 250 fuzzies that fits for the word "irom" -> "rom maiden", "iron maiden", ...
-			for k, queryToken := range queryTokens[:len(queryTokens)-1] {
-				firstTermFuzzies := se.Symspell.FuzzySearch(queryToken, 250)
-				firstTerms := make([]string, len(queryTokens)-1)
-				copy(firstTerms, queryTokens[:len(queryTokens)-1])
-				for _, firstTermFuzzy := range firstTermFuzzies {
-					firstTerms[k] = firstTermFuzzy
-					finalDocs := se.SearchMultipleTerms(firstTerms, lastTerm, lastTermGuessArr, filters, page)
-					if len(finalDocs) > 0 {
-						return &SearchResult{
-							Docs:            finalDocs,
-							IsMultiTerm:     true,
-							IsFuzzy:         false,
-							IsPrefixOrExact: false,
-						}
-					}
-				}
-			}
-		} else if searchStep == 2 {
-			// third search: if no found for the first 2 searches, go with only first term's fuzzies.
-			var firstTerms []string
-			for _, firstTerm := range queryTokens[:len(queryTokens)-1] {
-				_, ok := se.Keys.GetData()[firstTerm]
-				if ok {
 					firstTerms = append(firstTerms, firstTerm)
-				} else {
-					fuzzyWords := se.Symspell.FuzzySearch(firstTerm, 1)
-					if len(fuzzyWords) > 0 {
-						firstTerms = append(firstTerms, fuzzyWords[0])
-					} else {
-						firstTerms = append(firstTerms, firstTerm)
-					}
 				}
-			}
-			finalDocs := se.SearchMultipleTerms(firstTerms, "", nil, filters, page)
-			return &SearchResult{
-				Docs:            finalDocs,
-				IsMultiTerm:     true,
-				IsFuzzy:         false,
-				IsPrefixOrExact: false,
 			}
 		}
+		finalDocs := se.SearchMultipleTerms(firstTerms, lastTerm, lastTermGuessArr, filters, page)
+		return &SearchResult{
+			Docs:            finalDocs,
+			IsMultiTerm:     true,
+			IsFuzzy:         false,
+			IsPrefixOrExact: false,
+		}
+	} else if searchStep == 1 {
+		// second search: first term is an array of fuzzies.
+		// e.g., search for "irom maiden"
+		// check 250 fuzzies that fits for the word "irom" -> "rom maiden", "iron maiden", ...
+		var lastTermGuessArr []string
+		lastTerm := ""
+		if len(queryTokens[len(queryTokens)-1]) <= 3 {
+			lastTerm = queryTokens[len(queryTokens)-1]
+		} else {
+			lastTermGuessArr = se.Trie.SearchPrefix(queryTokens[len(queryTokens)-1], 1)
+		}
+		for k, queryToken := range queryTokens[:len(queryTokens)-1] {
+			firstTermFuzzies := se.Symspell.FuzzySearch(queryToken, 250)
+			firstTerms := make([]string, len(queryTokens)-1)
+			copy(firstTerms, queryTokens[:len(queryTokens)-1])
+			for _, firstTermFuzzy := range firstTermFuzzies {
+				firstTerms[k] = firstTermFuzzy
+				finalDocs := se.SearchMultipleTerms(firstTerms, lastTerm, lastTermGuessArr, filters, page)
+				if len(finalDocs) > 0 {
+					return &SearchResult{
+						Docs:            finalDocs,
+						IsMultiTerm:     true,
+						IsFuzzy:         false,
+						IsPrefixOrExact: false,
+					}
+				}
+			}
+		}
+	} else if searchStep == 2 {
+		// third search: if no found for the first 2 searches, go with only first term's fuzzies.
+		var firstTerms []string
+		for _, firstTerm := range queryTokens[:len(queryTokens)-1] {
+			_, ok := se.Keys.GetData()[firstTerm]
+			if ok {
+				firstTerms = append(firstTerms, firstTerm)
+			} else {
+				fuzzyWords := se.Symspell.FuzzySearch(firstTerm, 1)
+				if len(fuzzyWords) > 0 {
+					firstTerms = append(firstTerms, fuzzyWords[0])
+				} else {
+					firstTerms = append(firstTerms, firstTerm)
+				}
+			}
+		}
+		finalDocs := se.SearchMultipleTerms(firstTerms, "", nil, filters, page)
+		return &SearchResult{
+			Docs:            finalDocs,
+			IsMultiTerm:     true,
+			IsFuzzy:         false,
+			IsPrefixOrExact: false,
+		}
 	}
-
 	return nil
 }
 
