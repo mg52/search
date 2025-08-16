@@ -528,42 +528,6 @@ func TestTokenize(t *testing.T) {
 	}
 }
 
-func TestLevenshteinDistance(t *testing.T) {
-	tests := []struct {
-		a, b string
-		want int
-	}{
-		{"", "", 0},
-		{"a", "", 1},
-		{"", "abc", 3},
-		{"kitten", "sitting", 3},
-		{"flaw", "lawn", 2},
-	}
-	for _, tc := range tests {
-		if got := levenshteinDistance(tc.a, tc.b); got != tc.want {
-			t.Errorf("levenshteinDistance(%q,%q) = %d; want %d", tc.a, tc.b, got, tc.want)
-		}
-	}
-}
-
-func TestFuzzyMatch(t *testing.T) {
-	tests := []struct {
-		a, b    string
-		maxDist int
-		want    bool
-	}{
-		{"kitten", "sitting", 3, true},
-		{"kitten", "sitting", 2, false},
-		{"flaw", "lawn", 2, true},
-		{"flaw", "lawn", 1, false},
-	}
-	for _, tc := range tests {
-		if got := FuzzyMatch(tc.a, tc.b, tc.maxDist); got != tc.want {
-			t.Errorf("FuzzyMatch(%q,%q,%d) = %v; want %v", tc.a, tc.b, tc.maxDist, got, tc.want)
-		}
-	}
-}
-
 func TestUpdateDocumentDataOnly(t *testing.T) {
 	engine := buildTestEngine(t)
 	// "banana" appears in both doc1 and doc2, same weight => order not guaranteed
@@ -630,30 +594,13 @@ func TestApplyFilter_MultipleValuesSingleFilter(t *testing.T) {
 	}
 }
 
-// func TestApplyFilter_MultipleFilters(t *testing.T) {
-// 	se := newTestEngine(map[string]map[string]bool{
-// 		"author:Alice": {"doc1": true},
-// 		"tag:go":       {"doc2": true},
-// 	})
-
-// 	filters := map[string][]interface{}{
-// 		"author": {"Alice"},
-// 		"tag":    {"go"},
-// 	}
-// 	got := se.ApplyFilter(filters)
-// 	exp := map[string]bool{"doc1": true, "doc2": true}
-// 	if !reflect.DeepEqual(got, exp) {
-// 		t.Errorf("Expected %v, got %v", exp, got)
-// 	}
-// }
-
 func TestApplyFilter_NoFilters(t *testing.T) {
 	se := newTestEngine(nil)
 	filters := map[string][]interface{}{}
 	got := se.ApplyFilter(filters)
-	// Expect empty map (not nil)
-	if got == nil || len(got) != 0 {
-		t.Errorf("Expected empty map, got %v", got)
+	// With no filters provided, ApplyFilter returns nil.
+	if got != nil {
+		t.Errorf("Expected nil, got %v", got)
 	}
 }
 
@@ -661,9 +608,9 @@ func TestApplyFilter_MissingSingleValue(t *testing.T) {
 	se := newTestEngine(map[string]map[string]bool{})
 	filters := map[string][]interface{}{"author": {"Unknown"}}
 	got := se.ApplyFilter(filters)
-	// Single-value missing should return nil
-	if got != nil {
-		t.Errorf("Expected nil for missing filter, got %v", got)
+	// Missing single value now returns an empty map (no matches), not nil.
+	if got == nil || len(got) != 0 {
+		t.Errorf("Expected empty map, got %v", got)
 	}
 }
 
@@ -674,6 +621,87 @@ func TestApplyFilter_MissingValuesInMulti(t *testing.T) {
 	filters := map[string][]interface{}{"tag": {"go", "nope"}}
 	got := se.ApplyFilter(filters)
 	exp := map[string]bool{"doc1": true}
+	if !reflect.DeepEqual(got, exp) {
+		t.Errorf("Expected %v, got %v", exp, got)
+	}
+}
+
+// OR-within-field, AND-across-fields.
+func TestApplyFilter_ANDAcrossFields(t *testing.T) {
+	se := newTestEngine(map[string]map[string]bool{
+		"year:2020": {"doc1": true, "doc2": true},
+		"year:2021": {"doc2": true, "doc3": true},
+		"type:song": {"doc2": true, "doc3": true},
+	})
+	// (year=2020 OR 2021) AND (type=song) => doc2, doc3
+	filters := map[string][]interface{}{
+		"year": {2020, 2021},
+		"type": {"song"},
+	}
+	got := se.ApplyFilter(filters)
+	exp := map[string]bool{"doc2": true, "doc3": true}
+	if !reflect.DeepEqual(got, exp) {
+		t.Errorf("Expected %v, got %v", exp, got)
+	}
+}
+
+// AND across fields should yield empty intersection when one side is empty.
+func TestApplyFilter_ANDAcrossFields_EmptyIntersection(t *testing.T) {
+	se := newTestEngine(map[string]map[string]bool{
+		"year:2024": {"doc1": true},
+		"type:book": {"doc2": true},
+	})
+	// (year=2024) AND (type=song) => ∅
+	filters := map[string][]interface{}{
+		"year": {2024},
+		"type": {"song"},
+	}
+	got := se.ApplyFilter(filters)
+	if got == nil || len(got) != 0 {
+		t.Errorf("Expected empty map, got %v", got)
+	}
+}
+
+// numeric values should match via fmt.Sprintf("%v").
+func TestApplyFilter_NumericValues(t *testing.T) {
+	se := newTestEngine(map[string]map[string]bool{
+		"year:2024": {"doc1": true, "doc2": true},
+	})
+	filters := map[string][]interface{}{
+		"year": {2024},
+	}
+	got := se.ApplyFilter(filters)
+	exp := map[string]bool{"doc1": true, "doc2": true}
+	if !reflect.DeepEqual(got, exp) {
+		t.Errorf("Expected %v, got %v", exp, got)
+	}
+}
+
+// empty value slice for a field yields empty result.
+func TestApplyFilter_EmptyValuesSlice(t *testing.T) {
+	se := newTestEngine(map[string]map[string]bool{
+		"tag:go": {"doc1": true},
+	})
+	filters := map[string][]interface{}{
+		"tag": {},
+	}
+	got := se.ApplyFilter(filters)
+	if got == nil || len(got) != 0 {
+		t.Errorf("Expected empty map, got %v", got)
+	}
+}
+
+// union within a single field should de-duplicate shared docs.
+func TestApplyFilter_DedupWithinUnion(t *testing.T) {
+	se := newTestEngine(map[string]map[string]bool{
+		"tag:go":   {"doc1": true, "doc2": true},
+		"tag:test": {"doc2": true, "doc3": true},
+	})
+	filters := map[string][]interface{}{
+		"tag": {"go", "test"},
+	}
+	got := se.ApplyFilter(filters)
+	exp := map[string]bool{"doc1": true, "doc2": true, "doc3": true}
 	if !reflect.DeepEqual(got, exp) {
 		t.Errorf("Expected %v, got %v", exp, got)
 	}
@@ -706,25 +734,25 @@ func TestSearchEngineFlow_MultiTerm_LastTermLessThan2(t *testing.T) {
 	if len(resultDocs) != 5 {
 		t.Fatalf("expected 5 results, got %d", len(resultDocs))
 	}
-	if resultDocs[0].ID != "13" || resultDocs[0].ScoreWeight != 100000 {
-		t.Errorf("for 'smart c', expected {ID:\"13\",ScoreWeight:100000}, got %s - %d", resultDocs[0].ID, resultDocs[0].ScoreWeight)
-	}
-	if resultDocs[1].ID != "12" || resultDocs[1].ScoreWeight != 99999 {
-		t.Errorf("for 'smart c', expected {ID:\"12\",ScoreWeight:99999}, got %s - %d", resultDocs[1].ID, resultDocs[1].ScoreWeight)
+	if resultDocs[0].ID != "13" || resultDocs[0].ScoreWeight != 75000 {
+		t.Errorf("for 'smart c', expected {ID:\"13\",ScoreWeight:75000}, got %s - %d", resultDocs[0].ID, resultDocs[0].ScoreWeight)
 	}
 	if !((resultDocs[2].ID == "28" ||
 		resultDocs[2].ID == "2" ||
-		resultDocs[2].ID == "22") && resultDocs[2].ScoreWeight == 66666) {
+		resultDocs[2].ID == "22" ||
+		resultDocs[2].ID == "12") && resultDocs[2].ScoreWeight == 66666) {
 		t.Errorf("for 'smart c', expected {ID:\"28, 2, 22\",ScoreWeight:66666}, got %s - %d", resultDocs[2].ID, resultDocs[2].ScoreWeight)
 	}
 	if !((resultDocs[3].ID == "28" ||
 		resultDocs[3].ID == "2" ||
-		resultDocs[3].ID == "22") && resultDocs[3].ScoreWeight == 66666) {
+		resultDocs[3].ID == "22" ||
+		resultDocs[3].ID == "12") && resultDocs[3].ScoreWeight == 66666) {
 		t.Errorf("for 'smart c', expected {ID:\"28, 2, 22\",ScoreWeight:66666}, got %s - %d", resultDocs[3].ID, resultDocs[3].ScoreWeight)
 	}
 	if !((resultDocs[4].ID == "28" ||
 		resultDocs[4].ID == "2" ||
-		resultDocs[4].ID == "22") && resultDocs[4].ScoreWeight == 66666) {
+		resultDocs[4].ID == "22" ||
+		resultDocs[4].ID == "12") && resultDocs[4].ScoreWeight == 66666) {
 		t.Errorf("for 'smart c', expected {ID:\"28, 2, 22\",ScoreWeight:66666}, got %s - %d", resultDocs[4].ID, resultDocs[4].ScoreWeight)
 	}
 

@@ -41,6 +41,52 @@ docker run -d \
 
 ---
 
+## Benchmark
+
+This section summarizes the performance metrics obtained when indexing and querying our music metadata (MusicBrainz) dataset.
+
+* **Dataset**: MusicBrainz
+* **Record format** (JSON lines):
+
+  ```json
+  {"artist":"Modern Talking","song":"Heart of an Angel","id":"c7eda459-c11c-362f-a5c9-2c108c4a27e4","album":"Universe: The 12th Album"}
+  {"artist":"Modern Talking","song":"Who Will Be There","id":"366f83d1-bd0a-3ed8-9974-b148ae6d6dd9","album":"Universe: The 12th Album"}
+  ```
+* **Indexed fields**: `artist`, `song`, `album`
+* **Machine**: Used MacBook Air M3, 24GB Memory
+* **Sharding**: 5 shards configured
+* **Pagination**: Each shard serves 4 pages per request
+
+
+### Performance Test for 5 million data
+
+#### Index Performance
+
+* **Total indexing time**: 37 seconds
+
+#### Search Performance
+
+Benchmarking search queries over 50 parallel workers in 1 minute, simulating realistic user input, including:
+
+* **Query lengths**: 1 to 4 terms
+* **Prefix matching**: e.g., `Modern ta` matches `Modern Talking`
+* **Typo tolerance**: \~10% of queries include deliberate misspellings (e.g., `Never Was an mngel` for “angel”)
+* **Total requests**: 23863 in 1 minute
+
+**Latency statistics**
+
+| Metric                | Latency (milliseconds) |
+| --------------------- | ---------------------: |
+| Average (mean)        |               17.46 ms |
+| 50th percentile (P50) |               2.77 ms |
+| 90th percentile (P90) |               52.80 ms |
+| 95th percentile (P95) |               92.77 ms |
+| 99th percentile (P99) |              171.72 ms |
+
+
+---
+
+
 ## How It Works
 
 ### Index Design
@@ -132,8 +178,8 @@ Now search for `"affordable book"`:
 #### 1. **Resolve Tokens**
 
    * The first token (“affordable”) is treated as an exact match if it exists in `Keys`.
-   * The last token (“book”) is treated as a prefix query (i.e. `Trie.SearchPrefix("book")`), returning up to 1000 completions such as `["book","booking","booked"]`. 
-   * If there is no data within 1000 prefix search, it makes a second search for guessing first token in the SymSpell with levenshtein distance of 1.
+   * The last token (“book”) is treated as a prefix query (i.e. `Trie.SearchPrefix("book")`), returning up to 250 completions such as `["book","booking","booked"]`. 
+   * If there is no data within 250 prefix search, it makes a second search for guessing first token in the SymSpell with levenshtein distance of 1.
    * If there is no data again, it makes a third search for the only first token which is guessed using SymSpell.
 
 #### 2. **Primary Posting List**
@@ -190,8 +236,9 @@ Creates an *empty* index.
 ```json
 {
   "indexName": "products",
-  "duration": "123µs",
-  "durationMs": 0
+  "pageCount":4,
+  "shards":5,
+  "duration": "123µs"
 }
 ```
 
@@ -241,8 +288,8 @@ GET /search?index=products&q=laptop&page=0&filter=year:2020,category:electronics
     { "ID":"11","ScoreWeight":66666, "Data": {...} },
     …
   ],
-  "duration": "1.23ms",
-  "durationMs": 1
+  "duration": 1087695375,
+  "durationInMs": 1087
 }
 ```
 
