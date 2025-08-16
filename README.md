@@ -1,3 +1,6 @@
+<!-- Build (GitHub Actions) -->
+[![CI](https://github.com/mg52/search/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mg52/search/actions/workflows/ci.yml)
+
 # Go In-Memory Search Engine
 
 A lightweight, in-memory inverted-index search engine in Go, with HTTP handlers and on-disk persistence.  
