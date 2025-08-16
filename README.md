@@ -1,5 +1,4 @@
-<!-- Build (GitHub Actions) -->
-[![CI](https://github.com/mg52/search/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mg52/search/actions/workflows/ci.yml)
+![build](https://github.com/mg52/search/actions/workflows/go.yml/badge.svg)
 
 # Go In-Memory Search Engine
 
