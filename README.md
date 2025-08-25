@@ -1,6 +1,6 @@
 ![build](https://github.com/mg52/search/actions/workflows/go.yml/badge.svg)
 
-# Go In-Memory Search Engine
+# In-Memory Search Engine
 
 A lightweight, in-memory inverted-index search engine in Go, with HTTP handlers and on-disk persistence.  
 
@@ -15,6 +15,45 @@ A lightweight, in-memory inverted-index search engine in Go, with HTTP handlers 
 - **Docker-ready**: runs as an unprivileged user, persists under a mounted volume  
 
 ---
+
+## Benchmark
+
+**Latency statistics for 5 million data**
+
+| Metric                | Latency (milliseconds) |
+| --------------------- | ---------------------: |
+| Average (mean)        |               17.46 ms |
+| 50th percentile (P50) |               2.77 ms |
+| 90th percentile (P90) |               52.80 ms |
+| 95th percentile (P95) |               92.77 ms |
+| 99th percentile (P99) |              171.72 ms |
+
+
+* **Dataset**: MusicBrainz
+* **Record format** (JSON lines):
+
+  ```json
+  {"artist":"Modern Talking","song":"Heart of an Angel","id":"c7eda459-c11c-362f-a5c9-2c108c4a27e4","album":"Universe: The 12th Album"}
+  {"artist":"Modern Talking","song":"Who Will Be There","id":"366f83d1-bd0a-3ed8-9974-b148ae6d6dd9","album":"Universe: The 12th Album"}
+  ```
+* **Indexed fields**: `artist`, `song`, `album`
+* **Machine**: Used MacBook Air M3, 24GB Memory
+* **Sharding**: 5 shards configured
+* **Pagination**: Each shard serves 4 pages per request
+
+
+* **Total indexing time**: 37 seconds
+
+#### Search Performance
+
+* **Query lengths**: 1 to 4 terms
+* **Prefix matching**: e.g., `Modern ta` matches `Modern Talking`
+* **Typo tolerance**: \~10% of queries include deliberate misspellings (e.g., `Never Was an mngel` for “angel”)
+* **Total requests**: 23863 in 1 minute with 50 parallel workers
+
+
+---
+
 
 ## Quickstart
 
@@ -40,50 +79,6 @@ docker run -d \
   --name searchengine \
   searchengine:latest
 ```
-
----
-
-## Benchmark
-
-This section summarizes the performance metrics obtained when indexing and querying our music metadata (MusicBrainz) dataset.
-
-* **Dataset**: MusicBrainz
-* **Record format** (JSON lines):
-
-  ```json
-  {"artist":"Modern Talking","song":"Heart of an Angel","id":"c7eda459-c11c-362f-a5c9-2c108c4a27e4","album":"Universe: The 12th Album"}
-  {"artist":"Modern Talking","song":"Who Will Be There","id":"366f83d1-bd0a-3ed8-9974-b148ae6d6dd9","album":"Universe: The 12th Album"}
-  ```
-* **Indexed fields**: `artist`, `song`, `album`
-* **Machine**: Used MacBook Air M3, 24GB Memory
-* **Sharding**: 5 shards configured
-* **Pagination**: Each shard serves 4 pages per request
-
-
-### Performance Test for 5 million data
-
-#### Index Performance
-
-* **Total indexing time**: 37 seconds
-
-#### Search Performance
-
-Benchmarking search queries over 50 parallel workers in 1 minute, simulating realistic user input, including:
-
-* **Query lengths**: 1 to 4 terms
-* **Prefix matching**: e.g., `Modern ta` matches `Modern Talking`
-* **Typo tolerance**: \~10% of queries include deliberate misspellings (e.g., `Never Was an mngel` for “angel”)
-* **Total requests**: 23863 in 1 minute
-
-**Latency statistics**
-
-| Metric                | Latency (milliseconds) |
-| --------------------- | ---------------------: |
-| Average (mean)        |               17.46 ms |
-| 50th percentile (P50) |               2.77 ms |
-| 90th percentile (P90) |               52.80 ms |
-| 95th percentile (P95) |               92.77 ms |
-| 99th percentile (P99) |              171.72 ms |
 
 
 ---

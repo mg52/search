@@ -52,6 +52,10 @@ func NewSearchEngineController(indexFields []string,
 	}
 }
 
+// LoadAllShards initializes the controller by loading shard data from disk.
+// It looks under $INDEX_DATA_DIR (or ./data) in a per-index directory, expecting
+// subdirectories named shard-<N> that contain "<dir>.engine.gob". Shards are
+// assumed to be contiguous from 0..(N-1).
 func (sec *SearchEngineController) LoadAllShards(indexName string) error {
 	baseDir := os.Getenv("INDEX_DATA_DIR")
 	if baseDir == "" {
