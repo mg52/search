@@ -2,6 +2,7 @@ package http
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -93,8 +94,6 @@ func (ht *HTTP) Search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	startTime := time.Now()
-
 	query := r.URL.Query().Get("q")
 	pageStr := r.URL.Query().Get("page")
 	pageInt, err := strconv.Atoi(pageStr)
@@ -103,24 +102,36 @@ func (ht *HTTP) Search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse filters (filter=year:2017,year:2018,...)
+	// Parse filters
 	filters := make(map[string][]interface{})
 	filterStr := r.URL.Query().Get("filter")
 	if filterStr != "" {
 		for _, item := range strings.Split(filterStr, ",") {
 			parts := strings.SplitN(item, ":", 2)
 			if len(parts) != 2 {
-				// fmt.Printf("Skipping invalid filter: %s\n", item)
 				continue
 			}
-			key, val := parts[0], parts[1]
-			filters[key] = append(filters[key], val)
+			filters[parts[0]] = append(filters[parts[0]], parts[1])
 		}
 	}
 
-	result := sec.Search(query, pageInt, filters, 0)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	startTime := time.Now()
+
+	result := sec.Search(ctx, query, pageInt, filters, 0)
+
 	duration := time.Since(startTime)
-	// fmt.Printf("Search [%s] took %s for query %q\n", indexName, duration, query)
+
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			http.Error(w, "search timeout exceeded", http.StatusGatewayTimeout)
+			return
+		}
+		ErrWriter(w, err)
+		return
+	}
 
 	resp := map[string]interface{}{
 		"status":       "success",
@@ -131,11 +142,10 @@ func (ht *HTTP) Search(w http.ResponseWriter, r *http.Request) {
 		"duration":     duration,
 		"durationInMs": duration.Milliseconds(),
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		ErrWriter(w, err)
-	}
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {

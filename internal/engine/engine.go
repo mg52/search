@@ -5,6 +5,7 @@
 package engine
 
 import (
+	"context"
 	"encoding/gob"
 	"fmt"
 	"os"
@@ -19,6 +20,9 @@ import (
 	"github.com/mg52/search/internal/pkg/symspell"
 	"github.com/mg52/search/internal/pkg/trie"
 )
+
+// Number of max prefix for each word/term.
+const MaxPrefixTerms = 400
 
 // Document represents a single search hit.
 //
@@ -67,6 +71,7 @@ type enginePayload struct {
 	PageSize    int
 	Keys        *keys.Keys
 	Trie        *trie.Trie
+	Prefix      map[string][]string
 	Symspell    *symspell.SymSpell
 }
 
@@ -84,6 +89,7 @@ type SearchEngine struct {
 	FilterDocs  map[string]map[string]bool        // "field:value" -> set(docID)
 	Keys        *keys.Keys
 	Trie        *trie.Trie
+	Prefix      map[string][]string
 	Symspell    *symspell.SymSpell
 	IndexFields []string
 	Filters     map[string]bool // fields that may be used as filters
@@ -110,6 +116,7 @@ func NewSearchEngine(
 		ScoreIndex:  make(map[string][]Document),
 		Keys:        keys.NewKeys(),
 		Trie:        trie.NewTrie(),
+		Prefix:      make(map[string][]string),
 		Symspell:    symspell.NewSymSpell(),
 		FilterDocs:  make(map[string]map[string]bool),
 		PageSize:    pageSize,
@@ -144,6 +151,7 @@ func (se *SearchEngine) SaveAll(path string) error {
 		PageSize:    se.PageSize,
 		Keys:        se.Keys,
 		Trie:        se.Trie,
+		Prefix:      se.Prefix,
 		Symspell:    se.Symspell,
 	}
 
@@ -173,6 +181,7 @@ func LoadAll(path string, shardID int) (*SearchEngine, error) {
 		FilterDocs:  make(map[string]map[string]bool),
 		Keys:        keys.NewKeys(),
 		Trie:        trie.NewTrie(),
+		Prefix:      make(map[string][]string),
 		Symspell:    symspell.NewSymSpell(),
 		IndexFields: nil,
 		Filters:     make(map[string]bool),
@@ -198,6 +207,7 @@ func LoadAll(path string, shardID int) (*SearchEngine, error) {
 		se.PageSize = payload.PageSize
 		se.Keys = payload.Keys
 		se.Trie = payload.Trie
+		se.Prefix = payload.Prefix
 		se.Symspell = payload.Symspell
 	}
 
@@ -232,66 +242,9 @@ func (se *SearchEngine) Index(shardID int, docs []map[string]interface{}) {
 	fmt.Printf("BuildScoreIndex took: %s\n", duration)
 }
 
-// ProcessQuery tokenizes a raw string and categorizes tokens by match strategy.
-//
-// Returns a map with keys:
-//   - "raw":   tokenized inputs
-//   - "exact": tokens known to Keys (or their prefix/fuzzy fallbacks when multi-term)
-//   - "prefix": up to N prefix candidates (single-term path)
-//   - "fuzzy":  fuzzy candidates (single-term path)
-//
-// The second return value is the token count. This helper is separate from the
-// main Search path and can be used for UI explain/debug.
-func (se *SearchEngine) ProcessQuery(query string) (map[string][]string, int) {
-	queryTokens := Tokenize(query)
-	tokenCount := len(queryTokens)
-	if tokenCount == 0 {
-		return nil, 0
-	}
-
-	result := make(map[string][]string)
-	result["raw"] = queryTokens
-	if tokenCount == 1 {
-		guessArr := se.Trie.SearchPrefix(queryTokens[0], 3)
-		if guessArr != nil {
-			result["prefix"] = append(result["prefix"], guessArr...)
-		} else {
-			fuzzyWords := se.Symspell.FuzzySearch(queryTokens[0], 5)
-			if len(fuzzyWords) > 0 {
-				result["fuzzy"] = append(result["fuzzy"], fuzzyWords...)
-			} else {
-				result["fuzzy"] = append(result["fuzzy"], queryTokens[0])
-			}
-		}
-	} else {
-		// For multi-term, treat all but the last token as exact/fuzzy-corrected.
-		for _, exactWord := range queryTokens[:tokenCount-1] {
-			_, ok := se.Keys.GetData()[exactWord]
-			if ok {
-				result["exact"] = append(result["exact"], exactWord)
-			} else {
-				guessArr := se.Trie.SearchPrefix(exactWord, 1)
-				if guessArr != nil {
-					result["exact"] = append(result["exact"], guessArr[0])
-				} else {
-					fuzzyWords := se.Symspell.FuzzySearch(exactWord, 1)
-					if len(fuzzyWords) > 0 {
-						result["exact"] = append(result["exact"], fuzzyWords[0])
-					} else {
-						result["exact"] = append(result["exact"], exactWord)
-					}
-				}
-			}
-		}
-	}
-
-	return result, tokenCount
-}
-
 // BuildScoreIndex (re)constructs ScoreIndex by sorting each term's postings
 // descending by weight. It parallelizes over available CPUs.
 func (se *SearchEngine) BuildScoreIndex() {
-	// Snapshot term keys to avoid concurrent map iteration.
 	se.mu.RLock()
 	keys := make([]string, 0, len(se.Data))
 	for k := range se.Data {
@@ -308,8 +261,8 @@ func (se *SearchEngine) BuildScoreIndex() {
 		go func() {
 			defer wg.Done()
 			for key := range keysCh {
-				// Read postings and doc payloads under RLock.
 				var tempArr []Document
+
 				se.mu.RLock()
 				for docID, weight := range se.Data[key] {
 					tempArr = append(tempArr, Document{
@@ -454,18 +407,27 @@ func (se *SearchEngine) addToDocumentIndex(
 	normalizedWeight := (100_000 / length)
 
 	se.mu.Lock()
+	defer se.mu.Unlock()
 
 	docMap, ok := se.Data[term]
 	if !ok {
 		se.Keys.Insert(term)
-		se.Trie.Insert(term)
+		// se.Trie.Insert(term)
 		se.Symspell.AddWord(term)
 		docMap = make(map[string]int)
 		se.Data[term] = docMap
+
+		for i := 1; i < len(term); i++ {
+			if len(se.Prefix[term[0:i]]) >= MaxPrefixTerms {
+				continue
+			}
+			se.Prefix[term[0:i]] = append(se.Prefix[term[0:i]], term)
+		}
+		if len(se.Prefix[term]) < MaxPrefixTerms {
+			se.Prefix[term] = append(se.Prefix[term], term)
+		}
 	}
 	docMap[docID] += normalizedWeight
-
-	se.mu.Unlock()
 }
 
 // SearchOneTermWithoutFilter retrieves a page of results for a single term
@@ -581,36 +543,77 @@ func (se *SearchEngine) SearchOneTermWithFilter(query string, filters map[string
 //   - Accumulate total score across matched terms.
 //
 // Pagination is handled by slicing the accumulated results.
-func (se *SearchEngine) SearchMultipleTerms(firstTerms []string, lastTermGuessArr []string, filters map[string][]interface{}, page int) []Document {
-	filteredDocs := make(map[string]bool)
-	if len(filters) > 0 {
-		filteredDocs = se.ApplyFilter(filters)
+func (se *SearchEngine) SearchMultipleTerms(
+	ctx context.Context,
+	firstTerms []string,
+	lastTermGuessArr []string,
+	filters map[string][]interface{},
+	page int,
+) []Document {
+
+	if len(firstTerms) == 0 {
+		return nil
 	}
 
-	var finalDocs []Document
+	// ---- filters
+	var filteredDocs map[string]struct{}
+	if len(filters) > 0 {
+		tmp := se.ApplyFilter(filters)
+		filteredDocs = make(map[string]struct{}, len(tmp))
+		for id := range tmp {
+			filteredDocs[id] = struct{}{}
+		}
+	}
 
 	se.mu.RLock()
 	defer se.mu.RUnlock()
 
-	inputTerm := ""
-	if len(firstTerms) == 1 {
-		inputTerm = firstTerms[0]
-	} else if len(firstTerms) > 1 {
-		inputTerm = firstTerms[0]
-		for _, exactTerm := range firstTerms[1:] {
-			if len(se.ScoreIndex[exactTerm]) < len(se.ScoreIndex[inputTerm]) {
-				inputTerm = exactTerm
-			}
+	// scoreIndex := se.ScoreIndex
+	// data := se.Data
+	// documents := se.Documents
+	// pageSize := se.PageSize
+
+	inputTerm := firstTerms[0]
+	for _, t := range firstTerms[1:] {
+		if len(se.ScoreIndex[t]) < len(se.ScoreIndex[inputTerm]) {
+			inputTerm = t
 		}
-	} else {
-		return finalDocs
 	}
 
 	startIndex := page * se.PageSize
 	stopIndex := startIndex + se.PageSize
 
+	// ---- pre-resolve maps
+	exactMaps := make([]map[string]int, 0, len(firstTerms)-1)
+	for _, t := range firstTerms {
+		if t != inputTerm {
+			exactMaps = append(exactMaps, se.Data[t])
+		}
+	}
+
+	guessMaps := make([]map[string]int, 0, len(lastTermGuessArr))
+	for _, t := range lastTermGuessArr {
+		if m := se.Data[t]; m != nil {
+			guessMaps = append(guessMaps, m)
+		}
+	}
+
+	// ---- collect hits
+	type hit struct {
+		id    string
+		score int
+	}
+	hits := make([]hit, 0, stopIndex)
+
+outer:
 	for _, doc := range se.ScoreIndex[inputTerm] {
-		if len(filters) > 0 {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		if filteredDocs != nil {
 			if _, ok := filteredDocs[doc.ID]; !ok {
 				continue
 			}
@@ -618,74 +621,72 @@ func (se *SearchEngine) SearchMultipleTerms(firstTerms []string, lastTermGuessAr
 
 		totalScore := doc.ScoreWeight
 
-		if len(firstTerms) > 1 {
-			inAllExact := true
-			allOtherExactWeights := 0
-			for i := 0; i < len(firstTerms); i++ {
-				if inputTerm == firstTerms[i] {
-					continue
-				}
-				otherExactWeight, ok := se.Data[firstTerms[i]][doc.ID]
-				if !ok {
-					inAllExact = false
-					break
-				}
-				allOtherExactWeights += otherExactWeight
+		for _, m := range exactMaps {
+			w, ok := m[doc.ID]
+			if !ok {
+				continue outer
 			}
-			if !inAllExact {
-				continue
-			}
-
-			totalScore += allOtherExactWeights
+			totalScore += w
 		}
 
-		if len(lastTermGuessArr) > 0 {
-			foundOther := false
-			otherWeight := 0
-			for _, term := range lastTermGuessArr {
-				if otherData, ok := se.Data[term][doc.ID]; ok {
-					foundOther = true
-					otherWeight += otherData
+		if len(guessMaps) > 0 {
+			found := false
+			for _, m := range guessMaps {
+				if w, ok := m[doc.ID]; ok {
+					totalScore += w
+					found = true
 					break
 				}
 			}
-			if !foundOther {
+			if !found {
 				continue
 			}
-			totalScore += otherWeight
 		}
 
-		finalDocs = append(finalDocs, Document{
-			ID:          doc.ID,
-			Data:        se.Documents[doc.ID],
-			ScoreWeight: totalScore,
-		})
-		if len(finalDocs) >= stopIndex {
-			break
+		hits = append(hits, hit{id: doc.ID, score: totalScore})
+		if len(hits) >= stopIndex {
+			break // safe because scoreIndex is score-sorted
 		}
 	}
 
-	if startIndex >= len(finalDocs) {
+	if startIndex >= len(hits) {
 		return nil
 	}
-	if stopIndex > len(finalDocs) {
-		stopIndex = len(finalDocs)
+
+	if stopIndex > len(hits) {
+		stopIndex = len(hits)
 	}
 
-	return finalDocs[startIndex:stopIndex]
+	// ---- hydrate only the page
+	out := make([]Document, 0, stopIndex-startIndex)
+	for _, h := range hits[startIndex:stopIndex] {
+		out = append(out, Document{
+			ID:          h.id,
+			Data:        se.Documents[h.id],
+			ScoreWeight: h.score,
+		})
+	}
+
+	return out
 }
 
 // Search executes a query (single or multi-term), selecting between exact/prefix/fuzzy
 // strategies and honoring filters. searchStep controls fallback behavior for multi-term
 // queries (see MultiTermSearch).
-func (se *SearchEngine) Search(query string, page int, filters map[string][]interface{}, searchStep int) *SearchResult {
+func (se *SearchEngine) Search(ctx context.Context, query string, page int, filters map[string][]interface{}, searchStep int) *SearchResult {
+	select {
+	case <-ctx.Done():
+		return nil
+	default:
+	}
+
 	queryTokens := Tokenize(query)
 	if len(queryTokens) == 0 {
 		return nil
 	} else if len(queryTokens) == 1 {
 		return se.SingleTermSearch(queryTokens, page, filters)
 	} else {
-		return se.MultiTermSearch(queryTokens, page, filters, searchStep)
+		return se.MultiTermSearch(ctx, queryTokens, page, filters, searchStep)
 	}
 }
 
@@ -693,7 +694,17 @@ func (se *SearchEngine) Search(query string, page int, filters map[string][]inte
 // expansions, and applies filters if provided.
 func (se *SearchEngine) SingleTermSearch(queryTokens []string, page int, filters map[string][]interface{}) *SearchResult {
 	parsedQuery := make(map[string][]string)
-	guessArr := se.Trie.SearchPrefix(queryTokens[0], 3)
+	maxToken := 3
+	se.mu.RLock()
+	prefixTokens := se.Prefix[queryTokens[0]]
+	se.mu.RUnlock()
+	if len(prefixTokens) < maxToken {
+		maxToken = len(prefixTokens)
+	}
+	se.mu.RLock()
+	guessArr := se.Prefix[queryTokens[0]][:maxToken]
+	se.mu.RUnlock()
+	// guessArr := se.Trie.SearchPrefix(queryTokens[0], 3)
 	if guessArr != nil {
 		parsedQuery["prefix"] = append(parsedQuery["prefix"], guessArr...)
 	} else {
@@ -757,15 +768,25 @@ func (se *SearchEngine) SingleTermSearch(queryTokens []string, page int, filters
 // by searchStep:
 //
 //	0 (primary): fuzzy-correct all but the last token (1 suggestion each);
-//	             expand last token with up to 250 prefix candidates.
+//	             expand last token with up to 50 prefix candidates.
 //	1 (fallback): for each of the first tokens, try up to 50 fuzzy variants,
 //	             and restrict last token to 50 prefix candidates; return on first hit.
 //	2 (fallback): ignore last-term guessing; require documents to match the
 //	             fuzzy-corrected "first terms" only.
-func (se *SearchEngine) MultiTermSearch(queryTokens []string, page int, filters map[string][]interface{}, searchStep int) *SearchResult {
-	if searchStep == 0 {
-		// Primary search: prefix-expand last term; fuzzy-correct earlier terms (1 each).
-		lastTermGuessArr := se.Trie.SearchPrefix(queryTokens[len(queryTokens)-1], 250)
+func (se *SearchEngine) MultiTermSearch(ctx context.Context, queryTokens []string, page int, filters map[string][]interface{}, searchStep int) *SearchResult {
+	switch searchStep {
+	case 0:
+		// 1st search: prefix-expand last term; fuzzy-correct earlier terms (1 each).
+		// start := time.Now()
+		se.mu.RLock()
+		lastTermGuessArr := se.Prefix[queryTokens[len(queryTokens)-1]]
+		se.mu.RUnlock()
+		// lastTermGuessArr := se.Trie.SearchPrefix(queryTokens[len(queryTokens)-1], 250)
+		// duration := time.Since(start)
+		// fmt.Printf("Shard: %d, SearchPrefix %s, lastTermGuessArr: %v, duration: %s\n", se.ShardID, queryTokens[len(queryTokens)-1], lastTermGuessArr, duration)
+
+		// start = time.Now()
+		isFuzzy := false
 		var firstTerms []string
 		for _, firstTerm := range queryTokens[:len(queryTokens)-1] {
 			_, ok := se.Keys.GetData()[firstTerm]
@@ -778,25 +799,36 @@ func (se *SearchEngine) MultiTermSearch(queryTokens []string, page int, filters 
 				} else {
 					firstTerms = append(firstTerms, firstTerm)
 				}
+				isFuzzy = true
 			}
 		}
-		finalDocs := se.SearchMultipleTerms(firstTerms, lastTermGuessArr, filters, page)
+
+		// duration = time.Since(start)
+		// fmt.Printf("Shard: %d, FirstTerm: %s\n", se.ShardID, duration)
+
+		// start = time.Now()
+		finalDocs := se.SearchMultipleTerms(ctx, firstTerms, lastTermGuessArr, filters, page)
+		// duration = time.Since(start)
+		// fmt.Printf("Shard: %d, SearchMultipleTerms: %s\n", se.ShardID, duration)
+
 		return &SearchResult{
 			Docs:            finalDocs,
 			IsMultiTerm:     true,
-			IsFuzzy:         false,
+			IsFuzzy:         isFuzzy,
 			IsPrefixOrExact: false,
 		}
-	} else if searchStep == 1 {
-		// Secondary search: broaden fuzzies for earlier tokens; narrow last-term prefixes.
-		lastTermGuessArr := se.Trie.SearchPrefix(queryTokens[len(queryTokens)-1], 50)
+	case 1:
+		// 2nd search: broaden fuzzies for earlier tokens; narrow last-term prefixes.
+		// lastTermGuessArr := se.Trie.SearchPrefix(queryTokens[len(queryTokens)-1], 50)
+		lastTermGuessArr := se.Symspell.FuzzySearch(queryTokens[len(queryTokens)-1], 50)
+
 		for k, queryToken := range queryTokens[:len(queryTokens)-1] {
 			firstTermFuzzies := se.Symspell.FuzzySearch(queryToken, 50)
 			firstTerms := make([]string, len(queryTokens)-1)
 			copy(firstTerms, queryTokens[:len(queryTokens)-1])
 			for _, firstTermFuzzy := range firstTermFuzzies {
 				firstTerms[k] = firstTermFuzzy
-				finalDocs := se.SearchMultipleTerms(firstTerms, lastTermGuessArr, filters, page)
+				finalDocs := se.SearchMultipleTerms(ctx, firstTerms, lastTermGuessArr, filters, page)
 				if len(finalDocs) > 0 {
 					return &SearchResult{
 						Docs:            finalDocs,
@@ -813,8 +845,8 @@ func (se *SearchEngine) MultiTermSearch(queryTokens []string, page int, filters 
 			IsFuzzy:         false,
 			IsPrefixOrExact: false,
 		}
-	} else if searchStep == 2 {
-		// Tertiary search: drop last-term guessing; require only first-term matches.
+	case 2:
+		// 3rd search: drop last-term guessing; require only first-term matches.
 		var firstTerms []string
 		for _, firstTerm := range queryTokens[:len(queryTokens)-1] {
 			_, ok := se.Keys.GetData()[firstTerm]
@@ -829,7 +861,7 @@ func (se *SearchEngine) MultiTermSearch(queryTokens []string, page int, filters 
 				}
 			}
 		}
-		finalDocs := se.SearchMultipleTerms(firstTerms, nil, filters, page)
+		finalDocs := se.SearchMultipleTerms(ctx, firstTerms, nil, filters, page)
 		return &SearchResult{
 			Docs:            finalDocs,
 			IsMultiTerm:     true,
@@ -921,6 +953,33 @@ func (se *SearchEngine) addDocument(doc map[string]interface{}) {
 	}
 }
 
+func (se *SearchEngine) removeFromPrefix(term string) {
+	for i := 1; i <= len(term); i++ {
+		prefix := term[:i]
+
+		list, ok := se.Prefix[prefix]
+		if !ok {
+			continue
+		}
+
+		// Find and remove "term" from the slice
+		for j := 0; j < len(list); j++ {
+			if list[j] == term {
+				// swap-remove (order does NOT matter)
+				list[j] = list[len(list)-1]
+				list = list[:len(list)-1]
+				break
+			}
+		}
+
+		if len(list) == 0 {
+			delete(se.Prefix, prefix)
+		} else {
+			se.Prefix[prefix] = list
+		}
+	}
+}
+
 // removeDocumentByID deletes a document and cleans up all indexes.
 //
 // It removes the doc from term postings, ScoreIndex, DocData, filter sets,
@@ -935,7 +994,8 @@ func (se *SearchEngine) removeDocumentByID(docID string) {
 			delete(docMap, docID)
 			if len(docMap) == 0 {
 				se.Keys.Remove(term)
-				se.Trie.Remove(term)
+				// se.Trie.Remove(term)
+				se.removeFromPrefix(term)
 				se.Symspell.DeleteWord(term)
 				delete(se.Data, term)
 			}

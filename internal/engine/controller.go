@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"os"
@@ -172,7 +173,23 @@ func (sec *SearchEngineController) Index(docs []map[string]interface{}) {
 
 // Search executes the query on all shards in parallel, then merges results.
 // Parameters: query string, page number, and filter map. Returns sorted Documents.
-func (sec *SearchEngineController) Search(query string, page int, filters map[string][]interface{}, searchStep int) []Document {
+func (sec *SearchEngineController) Search(
+	ctx context.Context,
+	query string,
+	page int,
+	filters map[string][]interface{},
+	searchStep int,
+) []Document {
+	select {
+	case <-ctx.Done():
+		return nil
+	default:
+	}
+	// start := time.Now()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	resultsChan := make(chan *SearchResult, sec.SearchEngineCount)
 	var wg sync.WaitGroup
 
@@ -180,25 +197,106 @@ func (sec *SearchEngineController) Search(query string, page int, filters map[st
 		wg.Add(1)
 		go func(e *SearchEngine) {
 			defer wg.Done()
-			result := e.Search(query, page, filters, searchStep)
-			resultsChan <- result
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			res := e.Search(ctx, query, page, filters, searchStep)
+			if res != nil {
+				select {
+				case resultsChan <- res:
+				case <-ctx.Done():
+				}
+			}
 		}(se)
 	}
-	wg.Wait()
-	close(resultsChan)
 
-	res := CombineResults(resultsChan)
-	if res == nil {
-		return []Document{}
-	} else {
-		if len(res.Docs) == 0 && searchStep < 2 && res.IsMultiTerm {
-			// second and third search:
-			// if no result with multiple search, go with second and third search
-			// with more detailed fuzzy searches for the terms.
-			return sec.Search(query, page, filters, searchStep+1)
+	// Close channel when all goroutines finish
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
+	var collected []*SearchResult
+	docCount := 0
+
+	for res := range resultsChan {
+		collected = append(collected, res)
+		docCount += len(res.Docs)
+
+		// EARLY EXIT CONDITION
+		if docCount >= 8 {
+			cancel() // stop remaining searches
+			break
 		}
 	}
-	return res.Docs
+
+	final := CombineResultsFromSlice(collected)
+
+	// duration := time.Since(start)
+	// fmt.Printf("Search Step: %d: %s\n", searchStep, duration)
+
+	if final == nil {
+		return []Document{}
+	}
+
+	if len(final.Docs) == 0 && searchStep < 2 && final.IsMultiTerm {
+		return sec.Search(ctx, query, page, filters, searchStep+1)
+	}
+
+	return final.Docs
+}
+
+func CombineResultsFromSlice(results []*SearchResult) *CombinedResponse {
+	if len(results) == 0 {
+		return nil
+	}
+
+	var multi, prefix, fuzzy []Document
+
+	isMultiTerm := false
+	for _, res := range results {
+		if res == nil {
+			continue
+		}
+		if res.IsMultiTerm {
+			isMultiTerm = res.IsMultiTerm
+		}
+		switch {
+		case res.IsMultiTerm:
+			multi = append(multi, res.Docs...)
+		case res.IsPrefixOrExact:
+			prefix = append(prefix, res.Docs...)
+		case res.IsFuzzy:
+			fuzzy = append(fuzzy, res.Docs...)
+		}
+	}
+	var returnResult []Document
+	switch {
+	case len(multi) > 0:
+		returnResult = multi
+	case len(prefix) > 0:
+		returnResult = prefix
+	case len(fuzzy) > 0:
+		returnResult = fuzzy
+	default:
+		resp := CombinedResponse{
+			Docs:        returnResult,
+			IsMultiTerm: isMultiTerm,
+		}
+		return &resp
+	}
+
+	sort.Slice(returnResult, func(i, j int) bool {
+		return returnResult[i].ScoreWeight > returnResult[j].ScoreWeight
+	})
+
+	resp := CombinedResponse{
+		Docs:        returnResult,
+		IsMultiTerm: isMultiTerm,
+	}
+	return &resp
 }
 
 // CombineResults merges shard SearchResults by priority: multi-term, prefixOrExact, then fuzzy.
@@ -211,7 +309,9 @@ func CombineResults(resultsChan <-chan *SearchResult) *CombinedResponse {
 		if res == nil {
 			continue
 		}
-		isMultiTerm = res.IsMultiTerm
+		if res.IsMultiTerm {
+			isMultiTerm = res.IsMultiTerm
+		}
 		switch {
 		case res.IsMultiTerm:
 			multi = append(multi, res.Docs...)

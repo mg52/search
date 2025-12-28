@@ -18,17 +18,22 @@ A lightweight, in-memory inverted-index search engine in Go, with HTTP handlers 
 
 ## Benchmark
 
-**Latency statistics for 5 million data**
+**Latency statistics for 5 million data, 10000 requests in 14 seconds with 8 parallel workers**
 
 | Metric                | Latency (milliseconds) |
 | --------------------- | ---------------------: |
-| Average (mean)        |               17.46 ms |
-| 50th percentile (P50) |               2.77 ms |
-| 90th percentile (P90) |               52.80 ms |
-| 95th percentile (P95) |               92.77 ms |
-| 99th percentile (P99) |              171.72 ms |
+| Average (mean)        |               11.09 ms |
+| 50th percentile (P50) |               6.72 ms  |
+| 95th percentile (P95) |               33.47 ms |
+| 99th percentile (P99) |               57.40 ms |
 
 
+#### Details
+
+* **Query lengths**: 1 to 4 terms
+* **Prefix matching**: e.g., `Modern ta` matches `Modern Talking`
+* **Typo tolerance**: \~10% of queries include deliberate misspellings (e.g., `Never Was an mngel` for “angel”)
+* **Total requests**: 10000 in 14 seconds with 8 parallel workers
 * **Dataset**: MusicBrainz
 * **Record format** (JSON lines):
 
@@ -40,17 +45,8 @@ A lightweight, in-memory inverted-index search engine in Go, with HTTP handlers 
 * **Machine**: Used MacBook Air M3, 24GB Memory
 * **Sharding**: 5 shards configured
 * **Pagination**: Each shard serves 4 pages per request
-
-
 * **Total indexing time**: 37 seconds
-
-#### Search Performance
-
-* **Query lengths**: 1 to 4 terms
-* **Prefix matching**: e.g., `Modern ta` matches `Modern Talking`
-* **Typo tolerance**: \~10% of queries include deliberate misspellings (e.g., `Never Was an mngel` for “angel”)
-* **Total requests**: 23863 in 1 minute with 50 parallel workers
-
+* loadtest/loadtest.go file is used to perform the test
 
 ---
 

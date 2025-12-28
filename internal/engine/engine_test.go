@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	_ "embed"
 	"encoding/json"
 	"os"
@@ -35,108 +36,6 @@ func setupEngineWithKeys(keys []string) *SearchEngine {
 		se.Symspell.AddWord(k)
 	}
 	return se
-}
-
-func TestProcessQuery(t *testing.T) {
-	tests := []struct {
-		name     string
-		keys     []string
-		query    string
-		expected map[string][]string
-	}{
-		// {
-		// 	name:     "empty query",
-		// 	keys:     []string{"a", "b"},
-		// 	query:    "",
-		// 	expected: nil,
-		// },
-		// {
-		// 	name:  "exact match",
-		// 	keys:  []string{"foo", "bar"},
-		// 	query: "foo",
-		// 	expected: map[string][]string{
-		// 		"prefix": {"foo"},
-		// 		"raw":    {"foo"},
-		// 	},
-		// },
-		// {
-		// 	name:  "prefix match",
-		// 	keys:  []string{"apple", "apricot", "banana"},
-		// 	query: "ap",
-		// 	expected: map[string][]string{
-		// 		"prefix": {"apple", "apricot"},
-		// 		"raw":    {"ap"},
-		// 	},
-		// },
-		{
-			name:  "fuzzy match within tolerance",
-			keys:  []string{"kitten"},
-			query: "kiten", // one deletion away
-			expected: map[string][]string{
-				"fuzzy": {"kitten"},
-				"raw":   {"kiten"},
-			},
-		},
-		// {
-		// 	name:  "no match falls back to fuzzy with original",
-		// 	keys:  []string{"apple"},
-		// 	query: "xyz",
-		// 	expected: map[string][]string{
-		// 		"fuzzy": {"xyz"},
-		// 		"raw":   {"xyz"},
-		// 	},
-		// },
-		// {
-		// 	name:  "multiple tokens mixed types",
-		// 	keys:  []string{"apple", "apricot", "foo", "kite"},
-		// 	query: "ap foo ki",
-		// 	expected: map[string][]string{
-		// 		"exact":  {"apple", "foo"},
-		// 		"prefix": {"kite"},
-		// 		"raw":    {"ap", "foo", "ki"},
-		// 	},
-		// },
-		// {
-		// 	name:  "multiple tokens mixed types 2",
-		// 	keys:  []string{"apple", "apricot", "foo", "kite", "pepper"},
-		// 	query: "peppar f",
-		// 	expected: map[string][]string{
-		// 		"exact":  {"pepper"},
-		// 		"prefix": {"foo"},
-		// 		"raw":    {"peppar", "f"},
-		// 	},
-		// },
-		// {
-		// 	name:  "multiple tokens mixed types 3",
-		// 	keys:  []string{"apple", "apricot", "foo", "kite", "pepper", "fine"},
-		// 	query: "peppar f",
-		// 	expected: map[string][]string{
-		// 		"exact":  {"pepper"},
-		// 		"prefix": {"foo", "fine"},
-		// 		"raw":    {"peppar", "f"},
-		// 	},
-		// },
-		// {
-		// 	name:  "multiple tokens mixed types 4",
-		// 	keys:  []string{"apple", "apricot", "foo", "kite", "pepper", "fine"},
-		// 	query: "peppar fop",
-		// 	expected: map[string][]string{
-		// 		"exact": {"pepper"},
-		// 		"fuzzy": {"foo"},
-		// 		"raw":   {"peppar", "fop"},
-		// 	},
-		// },
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			se := setupEngineWithKeys(tt.keys)
-			got, _ := se.ProcessQuery(tt.query)
-			if !reflect.DeepEqual(got, tt.expected) {
-				t.Errorf("ProcessQuery(%q):\n got: %#v\nwant: %#v", tt.query, got, tt.expected)
-			}
-		})
-	}
 }
 
 func TestCombineResults(t *testing.T) {
@@ -227,10 +126,10 @@ func TestAddToDocumentIndex(t *testing.T) {
 	}
 
 	// Trie should return "foo" on prefix "f"
-	pref := se.Trie.SearchPrefix("f", 5)
-	if !reflect.DeepEqual(pref, []string{"foo"}) {
-		t.Errorf("expected Trie.SearchPrefix(\"f\")==[\"foo\"], got %v", pref)
-	}
+	// pref := se.Trie.SearchPrefix("f", 5)
+	// if !reflect.DeepEqual(pref, []string{"foo"}) {
+	// 	t.Errorf("expected Trie.SearchPrefix(\"f\")==[\"foo\"], got %v", pref)
+	// }
 }
 
 // TestBuildDocumentIndex verifies that BuildDocumentIndex tokenizes, indexes weights, and sets up filters.
@@ -275,18 +174,18 @@ func TestBuildDocumentIndex(t *testing.T) {
 	}
 
 	// check Trie can find each term via SearchPrefix
-	for term := range wantData {
-		pref := se.Trie.SearchPrefix(string(term[0]), 5)
-		found := false
-		for _, tkn := range pref {
-			if tkn == term {
-				found = true
-			}
-		}
-		if !found {
-			t.Errorf("Trie.SearchPrefix(%q) did not include %q; got %v", string(term[0]), term, pref)
-		}
-	}
+	// for term := range wantData {
+	// 	pref := se.Trie.SearchPrefix(string(term[0]), 5)
+	// 	found := false
+	// 	for _, tkn := range pref {
+	// 		if tkn == term {
+	// 			found = true
+	// 		}
+	// 	}
+	// 	if !found {
+	// 		t.Errorf("Trie.SearchPrefix(%q) did not include %q; got %v", string(term[0]), term, pref)
+	// 	}
+	// }
 
 	// check FilterDocs
 	wantFilter := "year:2020"
@@ -314,7 +213,7 @@ func buildTestEngine(t *testing.T) *SearchEngine {
 	return engine
 }
 
-func buildTestEngine2(t *testing.T) *SearchEngine {
+func buildTestEngineForMultipleSearch(t *testing.T) *SearchEngine {
 	// two fields indexed, one filter on "year"
 	engine := NewSearchEngine(
 		[]string{"name", "tags"},
@@ -325,6 +224,10 @@ func buildTestEngine2(t *testing.T) *SearchEngine {
 		{"id": "1", "name": "apple banana", "tags": []interface{}{"fruit"}, "year": 2020},
 		{"id": "2", "name": "banana cherry date", "tags": []interface{}{"fruit"}, "year": 2021},
 		{"id": "3", "name": "cherry date melon pear", "tags": []interface{}{"dry"}, "year": 2020},
+		{"id": "4", "name": "chemy date melon pear", "tags": []interface{}{"dry"}, "year": 2020},
+		{"id": "5", "name": "cherokee banana grape", "tags": []interface{}{"dry"}, "year": 2020},
+		{"id": "6", "name": "banana computer", "tags": []interface{}{"cherona"}, "year": 2020},
+		{"id": "7", "name": "banane great", "tags": []interface{}{"fruit"}, "year": 2020},
 	}
 	engine.Index(0, docs)
 	return engine
@@ -436,35 +339,57 @@ func TestSearchOneTermWithFilter(t *testing.T) {
 
 func TestEndToEnd_Search(t *testing.T) {
 	engine := buildTestEngine(t)
-
+	ctx := context.Background()
 	// exact one term
-	sr := engine.Search("apple", 0, nil, 0)
+	sr := engine.Search(ctx, "apple", 0, nil, 0)
 	if sr == nil || !sr.IsPrefixOrExact || len(sr.Docs) != 1 || sr.Docs[0].ID != "1" {
 		t.Errorf("Search apple exact failed: %+v", sr)
 	}
 
 	// prefix
-	sr = engine.Search("cher", 0, nil, 0)
+	sr = engine.Search(ctx, "cher", 0, nil, 0)
 	if sr == nil || !sr.IsPrefixOrExact || len(sr.Docs) != 2 {
 		t.Errorf("Search cher prefix failed: %+v", sr)
 	}
 
 	// fuzzy ("aple" -> apple)
-	sr = engine.Search("aple", 0, nil, 0)
+	sr = engine.Search(ctx, "aple", 0, nil, 0)
 	if sr == nil || !sr.IsFuzzy || len(sr.Docs) != 1 || sr.Docs[0].ID != "1" {
 		t.Errorf("Search aple fuzzy failed: %+v", sr)
 	}
 
 	// multi-term
-	sr = engine.Search("banana cherry", 0, nil, 0)
+	sr = engine.Search(ctx, "banana cherry", 0, nil, 0)
 	if sr == nil || !sr.IsMultiTerm || len(sr.Docs) != 1 || sr.Docs[0].ID != "2" {
 		t.Errorf("Search multi failed: %+v", sr)
 	}
 
 	// with filter
-	sr = engine.Search("banana", 0, map[string][]interface{}{"year": {2020}}, 0)
+	sr = engine.Search(ctx, "banana", 0, map[string][]interface{}{"year": {2020}}, 0)
 	if sr == nil || !sr.IsPrefixOrExact || len(sr.Docs) != 1 || sr.Docs[0].ID != "1" {
 		t.Errorf("Search banana with filter failed: %+v", sr)
+	}
+}
+
+func TestEndToEnd_MultipleSearchStep0(t *testing.T) {
+	engine := buildTestEngineForMultipleSearch(t)
+
+	ctx := context.Background()
+	// multi-term
+	sr := engine.Search(ctx, "banana che", 0, nil, 0)
+	if sr == nil || !sr.IsMultiTerm || len(sr.Docs) != 2 {
+		t.Errorf("Search multi failed: %+v", sr)
+	}
+}
+
+func TestEndToEnd_MultipleSearchStep1(t *testing.T) {
+	engine := buildTestEngineForMultipleSearch(t)
+
+	ctx := context.Background()
+	// multi-term
+	sr := engine.Search(ctx, "banane che", 0, nil, 1)
+	if sr == nil || !sr.IsMultiTerm || len(sr.Docs) != 2 {
+		t.Errorf("Search multi failed: %+v", sr)
 	}
 }
 
@@ -476,8 +401,10 @@ func TestAddAndRemoveDocument(t *testing.T) {
 	if _, ok := engine.Documents["4"]; !ok {
 		t.Fatal("addDocument did not insert doc4")
 	}
+
+	ctx := context.Background()
 	// ensure searchable
-	sr := engine.Search("egg", 0, nil, 0)
+	sr := engine.Search(ctx, "egg", 0, nil, 0)
 	if sr == nil || sr.Docs[0].ID != "4" {
 		t.Errorf("Search egg after add failed: %+v", sr)
 	}
@@ -487,7 +414,7 @@ func TestAddAndRemoveDocument(t *testing.T) {
 	if _, ok := engine.Documents["4"]; ok {
 		t.Error("removeDocumentByID did not delete doc4")
 	}
-	sr = engine.Search("egg", 0, nil, 0)
+	sr = engine.Search(ctx, "egg", 0, nil, 0)
 	// Accept either no SearchResult or an empty Docs slice
 	if sr != nil && len(sr.Docs) != 0 {
 		t.Errorf("expected no results after remove, got %+v", sr)
@@ -502,8 +429,9 @@ func TestAddAndRemoveDocument_ExistingString(t *testing.T) {
 	if _, ok := engine.Documents["4"]; !ok {
 		t.Fatal("addDocument did not insert doc4")
 	}
+	ctx := context.Background()
 	// ensure searchable
-	sr := engine.Search("banana", 0, nil, 0)
+	sr := engine.Search(ctx, "banana", 0, nil, 0)
 	if sr == nil || sr.Docs[0].ID != "4" || sr.Docs[0].ScoreWeight != 50000 {
 		t.Errorf("Search banana after add failed: %+v", sr)
 	}
@@ -513,7 +441,7 @@ func TestAddAndRemoveDocument_ExistingString(t *testing.T) {
 	if _, ok := engine.Documents["4"]; ok {
 		t.Error("removeDocumentByID did not delete doc4")
 	}
-	sr = engine.Search("banana", 0, nil, 0)
+	sr = engine.Search(ctx, "banana", 0, nil, 0)
 	if !((sr.Docs[0].ID == "1" || sr.Docs[0].ID == "2") && sr.Docs[0].ScoreWeight == 33333) {
 		t.Errorf("expected DocID 1 or 2 after removing banana, got %+v", sr)
 	}
@@ -723,8 +651,9 @@ func TestSearchEngineFlow_MultiTerm_LastTermLessThan2(t *testing.T) {
 
 	emptyFilters := make(map[string][]interface{})
 
+	ctx := context.Background()
 	// map[exact:[smart] prefix:[crop clay cream compact] raw:[smart c]]
-	result := engine.Search("smart c", 0, emptyFilters, 0)
+	result := engine.Search(ctx, "smart c", 0, emptyFilters, 0)
 	resultDocs := result.Docs
 
 	sort.Slice(resultDocs, func(i, j int) bool {
@@ -756,7 +685,7 @@ func TestSearchEngineFlow_MultiTerm_LastTermLessThan2(t *testing.T) {
 		t.Errorf("for 'smart c', expected {ID:\"28, 2, 22\",ScoreWeight:66666}, got %s - %d", resultDocs[4].ID, resultDocs[4].ScoreWeight)
 	}
 
-	result = engine.Search("smart c", 1, emptyFilters, 0)
+	result = engine.Search(ctx, "smart c", 1, emptyFilters, 0)
 	resultDocs = result.Docs
 
 	sort.Slice(resultDocs, func(i, j int) bool {
@@ -794,7 +723,7 @@ func TestSearchEngineFlow_MultiTerm_LastTermLessThan2(t *testing.T) {
 		t.Errorf("for 'smart c', expected {ID:\"26\",ScoreWeight:40000}, got %s - %d", resultDocs[4].ID, resultDocs[4].ScoreWeight)
 	}
 
-	result = engine.Search("smart c", 2, emptyFilters, 0)
+	result = engine.Search(ctx, "smart c", 2, emptyFilters, 0)
 	resultDocs = result.Docs
 
 	if len(resultDocs) != 2 {
@@ -808,4 +737,115 @@ func TestSearchEngineFlow_MultiTerm_LastTermLessThan2(t *testing.T) {
 		resultDocs[1].ID == "15") && resultDocs[1].ScoreWeight == 33332) {
 		t.Errorf("for 'smart c', expected {ID:\"27, 15\",ScoreWeight:33332}, got %s - %d", resultDocs[1].ID, resultDocs[1].ScoreWeight)
 	}
+}
+
+func TestRemoveFromPrefix_RemovesTermFromAllPrefixes(t *testing.T) {
+	se := &SearchEngine{
+		Prefix: make(map[string][]string),
+	}
+
+	term := "john"
+
+	// Simulate addToIndex behavior
+	se.Prefix["j"] = []string{"john", "jane", "jordan"}
+	se.Prefix["jo"] = []string{"john", "jordan"}
+	se.Prefix["joh"] = []string{"john"}
+	se.Prefix["john"] = []string{"john"}
+
+	se.removeFromPrefix(term)
+
+	tests := []struct {
+		prefix string
+		want   []string
+	}{
+		{"j", []string{"jane", "jordan"}},
+		{"jo", []string{"jordan"}},
+		{"joh", nil},
+		{"john", nil},
+	}
+
+	for _, tt := range tests {
+		got, ok := se.Prefix[tt.prefix]
+		if tt.want == nil {
+			if ok {
+				t.Errorf("expected prefix %q to be deleted, but got %v", tt.prefix, got)
+			}
+			continue
+		}
+
+		if !ok {
+			t.Errorf("expected prefix %q to exist", tt.prefix)
+			continue
+		}
+
+		if !equalUnordered(got, tt.want) {
+			t.Errorf("prefix %q: got %v, want %v", tt.prefix, got, tt.want)
+		}
+	}
+}
+
+func TestRemoveFromPrefix_NonExistingTerm(t *testing.T) {
+	se := &SearchEngine{
+		Prefix: make(map[string][]string),
+	}
+
+	se.Prefix["ja"] = []string{"jane"}
+
+	se.removeFromPrefix("john")
+
+	if !equalUnordered(se.Prefix["ja"], []string{"jane"}) {
+		t.Errorf("prefix modified unexpectedly: %v", se.Prefix["ja"])
+	}
+}
+
+func TestRemoveFromPrefix_DoesNotAffectOtherTerms(t *testing.T) {
+	se := &SearchEngine{
+		Prefix: make(map[string][]string),
+	}
+
+	se.Prefix["j"] = []string{"john", "jane", "jack"}
+	se.Prefix["ja"] = []string{"jane", "jack"}
+
+	se.removeFromPrefix("john")
+
+	if !equalUnordered(se.Prefix["j"], []string{"jane", "jack"}) {
+		t.Errorf("unexpected prefix content: %v", se.Prefix["j"])
+	}
+
+	if !equalUnordered(se.Prefix["ja"], []string{"jane", "jack"}) {
+		t.Errorf("unexpected prefix content: %v", se.Prefix["ja"])
+	}
+}
+
+func TestRemoveFromPrefix_DuplicateEntries(t *testing.T) {
+	se := &SearchEngine{
+		Prefix: make(map[string][]string),
+	}
+
+	se.Prefix["j"] = []string{"john", "john", "jane"}
+
+	se.removeFromPrefix("john")
+
+	if !equalUnordered(se.Prefix["j"], []string{"john", "jane"}) &&
+		!equalUnordered(se.Prefix["j"], []string{"jane"}) {
+		t.Errorf("unexpected prefix content: %v", se.Prefix["j"])
+	}
+}
+
+func equalUnordered(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	count := make(map[string]int, len(a))
+	for _, v := range a {
+		count[v]++
+	}
+	for _, v := range b {
+		count[v]--
+		if count[v] < 0 {
+			return false
+		}
+	}
+	return true
 }
