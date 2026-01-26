@@ -2,38 +2,34 @@
 
 # In-Memory Search Engine
 
-A lightweight, in-memory inverted-index search engine in Go, with HTTP handlers and on-disk persistence.  
+A lightweight, fast, in-memory inverted-index search engine with HTTP handlers and on-disk persistence.  
 
 ## Features
 
 - **Full-text indexing** on arbitrary JSON documents  
-- **Prefix & fuzzy matching** via a Trie + Levenshtein distance calculation 
-- **Sharded engines** for parallel indexing & search  
-- **Filters** on arbitrary document fields  
-- **HTTP API** for index creation, search, updates, removal  
-- **Persistence**: snapshot & load shards as Gob files under `/data/<indexName>/shard-<id>/`  
+- **Prefix & fuzzy matching** prefix lists + SymSpell with Levenshtein distance calculation 
+- **Filters** on arbitrary document fields (OR within a field, AND across fields)  
+- **HTTP API** for index creation, search, single-doc upsert/delete, bulk add 
+- **Persistence**: saves documents + index metadata and rebuilds all derived indexes on load  
 - **Docker-ready**: runs as an unprivileged user, persists under a mounted volume  
 
 ---
 
 ## Benchmark
 
-**Latency statistics for 5 million data, 10000 requests in 14 seconds with 8 parallel workers**
+**Latency statistics for 5 million data**
 
-| Metric                | Latency (milliseconds) |
-| --------------------- | ---------------------: |
-| Average (mean)        |               11.09 ms |
-| 50th percentile (P50) |               6.72 ms  |
-| 95th percentile (P95) |               33.47 ms |
-| 99th percentile (P99) |               57.40 ms |
+|     Avg |      P50 |       P95 |       P99 | Index Time |
+|-------: | -------: | --------: | --------: | ---------: |
+| 6.76 ms |  3.52 ms |  20.95 ms |  56.55 ms |      1m42s |
 
 
 #### Details
 
-* **Query lengths**: 1 to 4 terms
+* **Total requests**: 10000 requests with 8 parallel workers in 9 seconds for 5 million data
+* **Query lengths**: 1 to 4 terms e.g., `Last Night`, `The Only Thing Br`, `Modern`, `Real Ghod Time`
 * **Prefix matching**: e.g., `Modern ta` matches `Modern Talking`
 * **Typo tolerance**: \~10% of queries include deliberate misspellings (e.g., `Never Was an mngel` for “angel”)
-* **Total requests**: 10000 in 14 seconds with 8 parallel workers
 * **Dataset**: MusicBrainz
 * **Record format** (JSON lines):
 
@@ -43,9 +39,7 @@ A lightweight, in-memory inverted-index search engine in Go, with HTTP handlers 
   ```
 * **Indexed fields**: `artist`, `song`, `album`
 * **Machine**: Used MacBook Air M3, 24GB Memory
-* **Sharding**: 5 shards configured
-* **Pagination**: Each shard serves 4 pages per request
-* **Total indexing time**: 37 seconds
+* **Pagination**: 10 pages per request
 * loadtest/loadtest.go file is used to perform the test
 
 ---
@@ -84,124 +78,43 @@ docker run -d \
 
 ### Index Design
 
-This engine uses two primary in-memory structures to enable fast, score-based search:
+This engine keeps the core inverted index in memory and uses tombstones for updates/deletes.
 
-#### 1. **Inverted Index (`Data`)**
-
-   ```go
-   Data map[string]map[string]int
-   // └── term → (docID → weight)
-   ```
-
-   * Whenever a document is indexed, each token (word) is recorded under `Data[token][docID] = weight`.
-   * The weight for each occurrence is calculated as `100000 ÷ (total tokens in that document)`. If the same token appears multiple times in a document, its weights are summed.
-
-#### 2. **Sorted Posting List (`ScoreIndex`)**
+#### 1. **Inverted Index (`DataMap`)**
 
    ```go
-   ScoreIndex map[string][]Document
-   // └── term → sorted slice of {ID, ScoreWeight}
+   DataMap map[string]map[uint32]int
+   // term -> internalDocID -> score
    ```
 
-   * After indexing completes, we call `BuildScoreIndex()`. For each term, this method collects all `(docID, weight)` pairs from `Data[term]`, sorts them in descending order by weight, and stores the result as `ScoreIndex[term]`.
-   * Because `ScoreIndex[term]` is already sorted, a single-term lookup is extremely fast: to retrieve page 0 of “book,” the engine simply returns `ScoreIndex["book"][0:PageSize]` (which is O(1) to look up and O(PageSize) to copy).
+   * Each document is tokenized from the configured `IndexFields`.
+   * Each token contributes a per-document score of `100000 ÷ (total tokens in that document)`. 
+   * If a token appears multiple times in a doc, its score is summed.
 
-#### 3. **Keys, Trie and SymSpell**
+#### 2. **Internal IDs + Tombstones**
 
-   * During indexing, every unique token is also added to a `Keys` map (for quick existence checks) and inserted into a `Trie` (for prefix lookups) and inserted into `SymSpell`.
-   * `Keys` is used for checking exact matching. 
-   * `Trie` is for keeping all prefix candidates of given string.
-   * `SymSpell` is for keeping all keys' fuzzy matchings (Levenshtein distance ≤ 1)
+   Documents are stored and referenced by an internal numeric ID:
 
----
+   * `ExternalToInternal`: external string ID → current internal ID
+   * `InternalToExternal`: internal ID → external ID
+   * `DocDeleted[internalID] = true` tombstones old versions
+  
+   Update semantics:
 
-### Single-Term Search Example
+   * Updating a doc creates a new internal ID and tombstones the old internal ID.
+   * Searches always skip tombstoned internal IDs.
+   
+   This avoids expensive deletions from posting lists at update time.
 
-Assume we have indexed these two documents (indexing only the `"name"` and `"tags"` fields):
+#### 3. **Prefix & Fuzzy Structures**
 
-```json
-{ "id": "17", "name": "affordable book", "tags": ["book","shop"], "year": 2015 }
-{ "id": "42", "name": "used book sale", "tags": ["book","discount"], "year": 2018 }
-```
+   During indexing, tokens are also inserted into:
 
-#### 1. **Tokenize & Weight**
+   * `Prefix map[string][]string`: a precomputed list of prefix → candidate terms (capped by `MaxPrefixTerms`)
+   * `Keys`: a set of known terms (fast exact existence checks)
+   * `SymSpell`: used to suggest fuzzy terms when prefix candidates are insufficient
 
-   * Document 17’s tokens: `["affordable","book","book","shop"]` (4 tokens total)
-   * Each occurrence of “book” gets a weight of ⌊100000 ÷ 4⌋ = 25000, and since “book” appears twice, `Data["book"]["17"] = 50000`.
-   * Document 42’s tokens: `["used","book","sale","book","discount"]` (5 tokens)
-   * Each “book” is weighted ⌊100000 ÷ 5⌋ = 20000, so `Data["book"]["42"] = 40000`.
-
-#### 2. **BuildScoreIndex**
-
-   * After indexing both docs, `BuildScoreIndex()` sorts the posting list for “book” by weight:
-
-     ```go
-     ScoreIndex["book"] = []Document{
-       {ID:"17", ScoreWeight:50000},
-       {ID:"42", ScoreWeight:40000},
-       // …any other docs that contain “book”
-     }
-     ```
-
-#### 3. **Search**
-   A request like:
-
-   ```
-   GET /search?index=products&q=book&page=0
-   ```
-
-   simply returns:
-
-   ```json
-   [
-     { "ID": "17", "ScoreWeight": 50000, "Data": {...} },
-     { "ID": "42", "ScoreWeight": 40000, "Data": {...} }
-   ]
-   ```
-
-   in descending weight order.
-   If “book” were not in the `Keys` map, the engine would attempt a fuzzy match (edit distance ≤ 1).
-
----
-
-### Multi-Term Search Example
-
-Now search for `"affordable book"`:
-
-#### 1. **Resolve Tokens**
-
-   * The first token (“affordable”) is treated as an exact match if it exists in `Keys`.
-   * The last token (“book”) is treated as a prefix query (i.e. `Trie.SearchPrefix("book")`), returning up to 250 completions such as `["book","booking","booked"]`. 
-   * If there is no data within 250 prefix search, it makes a second search for guessing first token in the SymSpell with levenshtein distance of 1.
-   * If there is no data again, it makes a third search for the only first token which is guessed using SymSpell.
-
-#### 2. **Primary Posting List**
-
-   * We start by scanning `ScoreIndex["affordable"]` (e.g. `[{ID:"17",Weight:60000}, …]`) in descending order.
-
-#### 3. **Combine & Filter**
-
-   * For each document in descending “affordable” weight, we check if that `docID` also appears under any of the prefix matches (`Data["book"]`, `Data["booking"]`, `Data["booked"]`, etc.).
-   * If so, we compute a combined weight, for example:
-
-     ```
-     Data["affordable"]["17"] (60000) + Data["book"]["17"] (50000) = 110000
-     ```
-   * We collect `{ID:"17", ScoreWeight:110000}` into a result slice.
-   * We stop scanning once we have enough documents to fill the requested page (e.g. 10 matches).
-   * A document must match at least one prefix term to be included.
-
-#### 4. **Return Sorted Page**
-
-   * Since we scanned in descending “affordable” order and only kept docs that matched one of the prefix terms, our partial list is already roughly sorted by combined weight. We then truncate to exactly `PageSize` results and return that slice.
-
-If only document 17 contains both “affordable” and any “book\*” prefix, then:
-
-```json
-[
-  { "ID": "17", "ScoreWeight": 110000, "Data": {...} }
-]
-```
+  Single-term search prefers prefix candidates; when prefix isn’t enough it falls back to SymSpell suggestions.
 
 
 ## HTTP API
@@ -218,22 +131,11 @@ Content-Type: application/json
   "indexName":   "products",
   "indexFields": ["name","tags"],
   "filters":     ["year"],
-  "pageCount":   10,
-  "workers":     8
+  "pageCount":   10
 }
 ```
 
 Creates an *empty* index.
-**Response**:
-
-```json
-{
-  "indexName": "products",
-  "pageCount":4,
-  "shards":5,
-  "duration": "123µs"
-}
-```
 
 ### 2. Add to Index
 
@@ -243,19 +145,7 @@ Content-Type: multipart/form-data
 Content-Disposition: form-data; name="file"; filename="docs.json"
 Content-Type: application/json
 
-[ { "id":"1", "name":"foo", "tags":["a","b"], "year":2020 }, … ]
-```
-
-Appends documents from a JSON array into an existing index.
-**Response**:
-
-```json
-{
-  "indexName": "products",
-  "addedCount": 100,
-  "duration": "12ms",
-  "durationMs": 12
-}
+[ { "id":"1", "name":"foo", "tags":["a","b"], "year":"2020" }, ... ]
 ```
 
 ### 3. Search
@@ -269,120 +159,51 @@ GET /search?index=products&q=laptop&page=0&filter=year:2020,category:electronics
 * `page`: zero-based page number
 * `filter`: comma-separated `field:value` pairs
 
-**Response**:
-
-```json
-{
-  "status": "success",
-  "statusCode": 200,
-  "index": "products",
-  "query": "laptop",
-  "response": [
-    { "ID":"11","ScoreWeight":66666, "Data": {...} },
-    …
-  ],
-  "duration": 1087695375,
-  "durationInMs": 1087
-}
-```
 
 ### 4. Add or Update Single Document
 
 ```http
-POST /add-or-update-document?index=products
+POST /document?indexName=products
 Content-Type: application/json
 
-{ "id":"14", "name":"New Name", "tags":["x"], "year":2021 }
-```
-
-Inserts or updates one document, re-indexing as needed.
-**Response**:
-
-```json
 {
-  "status":"success",
-  "statusCode":200,
-  "index":"products",
-  "document": { /* the doc you sent */ }
+  "document": { "id":"14", "name":"New Name", "tags":["x"], "year":"2021" }
 }
 ```
 
-### 5. Bulk Add or Update
+Upserts one document (creates a new internal ID; tombstones old version if it exists).
+
+### 6. Delete Single Document
 
 ```http
-POST /add-or-update-document-bulk?index=products
-Content-Type: application/json
-
-[
-  { "id":"2", … },
-  { "id":"3", … }
-]
+DELETE /document?indexName=products&id=14
 ```
 
-Parallelized with a worker pool.
-**Response**:
-
-```json
-{
-  "status":"success",
-  "statusCode":200,
-  "index":"products",
-  "documentCount":2,
-  "duration":"5ms",
-  "durationMs":5
-}
-```
-
-### 6. Remove Document by ID
-
-```http
-DELETE /remove-document-by-id?index=products&id=14
-```
-
-Removes a document from all shards.
-**Response**:
-
-```json
-{
-  "status":"success",
-  "statusCode":200,
-  "index":"products",
-  "removedID":"14"
-}
-```
+Tombstones the current version of the document.
 
 ### 7. Save & Load Index (Persistence)
 
-* **Save** writes each shard under `/data/<indexName>/shard-<n>/…`:
+* **Save**:
 
-  ```http
-  POST /save-controller
-  Content-Type: application/json
+```http
+POST /save-controller
+Content-Type: application/json
 
-  { "indexName":"products" }
-  ```
-
-* **Load** reconstructs them at startup:
-
-  ```http
-  POST /load-controller
-  Content-Type: application/json
-
-  { "indexName":"products" }
-  ```
-
-**Response**:
-
-```json
-{
-  "status":"success",
-  "statusCode":200,
-  "indexName":"products",
-  "shards":3,
-  "duration":"10ms",
-  "durationMs":10
-}
+{ "indexName":"products" }
 ```
+
+Writes `engine.gob` under `/data/<indexName>/engine.gob` (or `INDEX_DATA_DIR` if set).
+
+* **Load**:
+
+```http
+POST /load-controller
+Content-Type: application/json
+
+{ "indexName":"products" }
+```
+
+Loads the snapshot and rebuilds indexes from stored documents.
 
 ### 8. Health Check
 

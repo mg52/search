@@ -1,11 +1,10 @@
-// Package engine implements a lightweight, in-memory, shardable search engine
+// Package engine implements a lightweight, in-memory search engine
 // built on an inverted index with prefix (Trie) and fuzzy (SymSpell) matching.
 // It is concurrency-safe for reads/writes via an internal RWMutex and is
 // designed to be persisted/restored via a single gob payload.
 package engine
 
 import (
-	"context"
 	"encoding/gob"
 	"fmt"
 	"os"
@@ -21,35 +20,31 @@ import (
 	"github.com/mg52/search/internal/pkg/trie"
 )
 
+type internalHit struct {
+	id    uint32
+	score int
+}
+
+// TODO: make it a variable
 // Number of max prefix for each word/term.
 const MaxPrefixTerms = 400
 
-// Document represents a single search hit.
-//
-// ID is the string form of the original document's "id" field.
-// Data holds the original document key/value pairs for retrieval.
-// ScoreWeight is the term-weight score accumulated during indexing/search.
 type Document struct {
-	ID          string
-	Data        map[string]interface{}
-	ScoreWeight int
+	ID    string
+	Score int
 }
 
-// SearchResult encapsulates the outcome of a query executed on a single shard.
-//
-// Docs            The page of results.
-// IsMultiTerm     True when the input contained more than one token.
-// IsPrefixOrExact True when the result path used exact or prefix expansion.
-// IsFuzzy         True when the result path used fuzzy expansion.
-// PrefixLength    Reserved field for prefix depth (not currently set here).
+type ReturnedDocument struct {
+	ID    string
+	Data  map[string]interface{}
+	Score int
+}
+
 type SearchResult struct {
-	Docs            []Document
-	IsMultiTerm     bool
-	IsPrefixOrExact bool
-	IsFuzzy         bool
-	PrefixLength    int
+	Docs []ReturnedDocument
 }
 
+// TODO: make it a variable
 // stopWords lists very common words excluded from indexing.
 var stopWords = map[string]bool{
 	"a":   true,
@@ -58,76 +53,67 @@ var stopWords = map[string]bool{
 }
 
 // enginePayload is the gob-serializable snapshot of SearchEngine state.
-//
-// It intentionally mirrors the live fields used by SearchEngine so SaveAll/LoadAll
-// can persist/restore the engine with minimal glue.
 type enginePayload struct {
-	Data        map[string]map[string]int
-	Documents   map[string]map[string]interface{}
-	ScoreIndex  map[string][]Document
-	FilterDocs  map[string]map[string]bool
-	IndexFields []string
-	Filters     map[string]bool
-	PageSize    int
-	Keys        *keys.Keys
-	Trie        *trie.Trie
-	Prefix      map[string][]string
-	Symspell    *symspell.SymSpell
+	Documents          map[uint32]map[string]interface{}
+	DocDeleted         map[uint32]bool
+	ExternalToInternal map[string]uint32
+	InternalToExternal map[uint32]string
+	NextInternalID     uint32
+	IndexFields        []string
+	Filters            map[string]bool
+	PageSize           int
 }
 
 // SearchEngine maintains an inverted index plus auxiliary structures for
 // prefix and fuzzy lookup. It is safe for concurrent use.
-//
-// Concurrency: guards internal maps/slices with mu (RWMutex).
-// Sharding: ShardID identifies the shard this instance serves.
-// Persistence: SaveAll/LoadAll snapshot/restore most fields via gob.
 type SearchEngine struct {
-	ShardID     int
-	Data        map[string]map[string]int         // term -> docID -> weight
-	Documents   map[string]map[string]interface{} // docID -> original document fields
-	ScoreIndex  map[string][]Document             // term -> sorted []Document (by ScoreWeight desc)
-	FilterDocs  map[string]map[string]bool        // "field:value" -> set(docID)
+	// Core index
+	DataMap    map[string]map[uint32]int // term -> internalDocID -> postings
+	DocDeleted map[uint32]bool           // internalDocID -> deleted?
+
+	// ID mapping: updates create a NEW internalDocID and delete the previous one
+	ExternalToInternal map[string]uint32 // externalDocID -> current internalDocID
+	InternalToExternal map[uint32]string // internalDocID -> externalDocID
+	nextInternalID     uint32
+
+	// Docs + filters
+	Documents   map[uint32]map[string]interface{} // internalDocID -> doc fields
+	FilterDocs  map[string]map[uint32]bool        // "field:value" -> set(internalDocID)
 	Keys        *keys.Keys
 	Trie        *trie.Trie
 	Prefix      map[string][]string
 	Symspell    *symspell.SymSpell
 	IndexFields []string
-	Filters     map[string]bool // fields that may be used as filters
-	PageSize    int             // max results to return per page
-	mu          sync.RWMutex
+	Filters     map[string]bool
+	PageSize    int
+
+	mu sync.RWMutex
 }
 
 // NewSearchEngine constructs a new, empty engine ready to index documents.
-//
-// indexFields defines which doc fields are tokenized and weighted.
-// filters lists the fields eligible for structured filters.
-// pageSize controls pagination size in search responses.
-// shardID identifies this shard for logging/diagnostics only.
-func NewSearchEngine(
-	indexFields []string,
-	filters map[string]bool,
-	pageSize, shardID int) *SearchEngine {
+func NewSearchEngine(indexFields []string, filters map[string]bool, pageSize int) *SearchEngine {
 	return &SearchEngine{
-		ShardID:     shardID,
-		Data:        make(map[string]map[string]int),
-		Documents:   make(map[string]map[string]interface{}),
-		IndexFields: indexFields,
-		Filters:     filters,
-		ScoreIndex:  make(map[string][]Document),
-		Keys:        keys.NewKeys(),
-		Trie:        trie.NewTrie(),
-		Prefix:      make(map[string][]string),
-		Symspell:    symspell.NewSymSpell(),
-		FilterDocs:  make(map[string]map[string]bool),
-		PageSize:    pageSize,
+		DataMap:            make(map[string]map[uint32]int),
+		DocDeleted:         make(map[uint32]bool),
+		ExternalToInternal: make(map[string]uint32),
+		InternalToExternal: make(map[uint32]string),
+		nextInternalID:     1,
+		Documents:          make(map[uint32]map[string]interface{}),
+		IndexFields:        indexFields,
+		Filters:            filters,
+		Keys:               keys.NewKeys(),
+		Trie:               trie.NewTrie(),
+		Prefix:             make(map[string][]string),
+		Symspell:           symspell.NewSymSpell(),
+		FilterDocs:         make(map[string]map[uint32]bool),
+		PageSize:           pageSize,
 	}
 }
 
 func init() {
-	// Register types for gob persistence. This enables SaveAll/LoadAll to
-	// encode/decode the engine payload and related types.
 	gob.Register(enginePayload{})
 	gob.Register(Document{})
+	gob.Register(ReturnedDocument{})
 	gob.Register(map[string]interface{}{})
 	gob.Register([]interface{}{})
 	gob.Register(&trie.Trie{})
@@ -135,27 +121,25 @@ func init() {
 	gob.Register(&symspell.SymSpell{})
 }
 
-// SaveAll writes the engine snapshot to a single gob file at path + ".engine.gob".
-//
-// Only serializes fields in enginePayload. Returns an error on I/O or encoding failures.
+// -------------------- Persistence --------------------
+
+// SaveAll writes the engine snapshot to a single gob file at path + "/engine.gob".
 func (se *SearchEngine) SaveAll(path string) error {
 	se.mu.RLock()
 	defer se.mu.RUnlock()
 
 	payload := enginePayload{
-		Data:        se.Data,
-		Documents:   se.Documents,
-		FilterDocs:  se.FilterDocs,
-		IndexFields: se.IndexFields,
-		Filters:     se.Filters,
-		PageSize:    se.PageSize,
-		Keys:        se.Keys,
-		Trie:        se.Trie,
-		Prefix:      se.Prefix,
-		Symspell:    se.Symspell,
+		Documents:          se.Documents,
+		DocDeleted:         se.DocDeleted,
+		ExternalToInternal: se.ExternalToInternal,
+		InternalToExternal: se.InternalToExternal,
+		NextInternalID:     se.nextInternalID,
+		IndexFields:        se.IndexFields,
+		Filters:            se.Filters,
+		PageSize:           se.PageSize,
 	}
 
-	engineFile := path + ".engine.gob"
+	engineFile := path + "/engine.gob"
 	f, err := os.Create(engineFile)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", engineFile, err)
@@ -169,325 +153,766 @@ func (se *SearchEngine) SaveAll(path string) error {
 	return nil
 }
 
-// LoadAll restores an engine snapshot from path + ".engine.gob".
-//
-// Missing files are tolerated (engine returns empty/default state). ScoreIndex
-// is rebuilt after load to restore sorted postings per term.
-func LoadAll(path string, shardID int) (*SearchEngine, error) {
+// LoadAll restores documents + metadata, then rebuilds ALL derived structures
+// (DataMap, FilterDocs, Keys, Prefix, Symspell) from Documents.
+func LoadAll(path string) (*SearchEngine, error) {
+	engineFile := path + "/engine.gob"
+	f, err := os.Open(engineFile)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", engineFile, err)
+	}
+	defer f.Close()
+
+	var payload enginePayload
+	dec := gob.NewDecoder(f)
+	if err := dec.Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decode engine payload: %w", err)
+	}
+
+	// Base engine (derived fields empty; we will rebuild)
 	se := &SearchEngine{
-		Data:        make(map[string]map[string]int),
-		Documents:   make(map[string]map[string]interface{}),
-		ScoreIndex:  make(map[string][]Document),
-		FilterDocs:  make(map[string]map[string]bool),
-		Keys:        keys.NewKeys(),
-		Trie:        trie.NewTrie(),
-		Prefix:      make(map[string][]string),
-		Symspell:    symspell.NewSymSpell(),
-		IndexFields: nil,
-		Filters:     make(map[string]bool),
-		PageSize:    0,
-		ShardID:     shardID,
+		DataMap:            make(map[string]map[uint32]int),
+		DocDeleted:         make(map[uint32]bool),
+		ExternalToInternal: make(map[string]uint32),
+		InternalToExternal: make(map[uint32]string),
+		nextInternalID:     1,
+		Documents:          make(map[uint32]map[string]interface{}),
+		FilterDocs:         make(map[string]map[uint32]bool),
+		Keys:               keys.NewKeys(),
+		Trie:               trie.NewTrie(),
+		Prefix:             make(map[string][]string),
+		Symspell:           symspell.NewSymSpell(),
+		IndexFields:        nil,
+		Filters:            make(map[string]bool),
+		PageSize:           0,
 	}
 
-	engineFile := path + ".engine.gob"
-	if f, err := os.Open(engineFile); err == nil {
-		var payload enginePayload
-		dec := gob.NewDecoder(f)
-		if err := dec.Decode(&payload); err != nil {
-			f.Close()
-			return nil, fmt.Errorf("decode engine payload: %w", err)
+	// Restore docs + metadata
+	se.Documents = payload.Documents
+	se.DocDeleted = payload.DocDeleted
+	se.ExternalToInternal = payload.ExternalToInternal
+	se.InternalToExternal = payload.InternalToExternal
+	se.nextInternalID = payload.NextInternalID
+	se.IndexFields = payload.IndexFields
+	se.Filters = payload.Filters
+	se.PageSize = payload.PageSize
+
+	// Safety: if NextInternalID missing/zero in older payloads
+	if se.nextInternalID == 0 {
+		var max uint32
+		for id := range se.InternalToExternal {
+			if id > max {
+				max = id
+			}
 		}
-		f.Close()
-
-		se.Data = payload.Data
-		se.Documents = payload.Documents
-		se.FilterDocs = payload.FilterDocs
-		se.IndexFields = payload.IndexFields
-		se.Filters = payload.Filters
-		se.PageSize = payload.PageSize
-		se.Keys = payload.Keys
-		se.Trie = payload.Trie
-		se.Prefix = payload.Prefix
-		se.Symspell = payload.Symspell
+		se.nextInternalID = max + 1
+		if se.nextInternalID == 0 {
+			se.nextInternalID = 1
+		}
 	}
 
-	se.BuildScoreIndex()
+	// -------- Rebuild derived structures from Documents --------
+	//
+	// We rebuild ONLY current (non-deleted) versions:
+	// - If ExternalToInternal points to internalID X, and X is not deleted => index it.
+	// - Old internal IDs remain in Documents but are tombstoned => skipped.
+
+	// Helper to check if an internal docID is the current one for its externalID
+	isCurrent := func(internalID uint32) bool {
+		ext := se.InternalToExternal[internalID]
+		if ext == "" {
+			return false
+		}
+		cur, ok := se.ExternalToInternal[ext]
+		return ok && cur == internalID
+	}
+
+	for internalID, doc := range se.Documents {
+		if doc == nil {
+			continue
+		}
+		if se.DocDeleted[internalID] {
+			continue
+		}
+		if !isCurrent(internalID) {
+			continue
+		}
+
+		// 1) Collect tokens from index fields
+		var allTokens []string
+		for _, field := range se.IndexFields {
+			val, ok := doc[field]
+			if !ok {
+				continue
+			}
+			switch v := val.(type) {
+			case string:
+				allTokens = append(allTokens, Tokenize(v)...)
+			case []string:
+				for _, s := range v {
+					allTokens = append(allTokens, Tokenize(s)...)
+				}
+			case []interface{}:
+				for _, item := range v {
+					if s, ok := item.(string); ok {
+						allTokens = append(allTokens, Tokenize(s)...)
+					}
+				}
+			}
+		}
+
+		// 2) Index tokens using existing helper (locks internally)
+		for _, token := range allTokens {
+			se.addToDocumentIndex(token, internalID, len(allTokens))
+		}
+
+		// 3) Rebuild filter docs
+		for field := range se.Filters {
+			val, ok := doc[field]
+			if !ok {
+				continue
+			}
+
+			switch v := val.(type) {
+			case int, int8, int16, int32, int64, float32, float64:
+				filterKey := fmt.Sprintf("%s:%v", field, v)
+				se.mu.Lock()
+				if se.FilterDocs[filterKey] == nil {
+					se.FilterDocs[filterKey] = make(map[uint32]bool)
+				}
+				se.FilterDocs[filterKey][internalID] = true
+				se.mu.Unlock()
+
+			case string:
+				filterKey := fmt.Sprintf("%s:%s", field, v)
+				se.mu.Lock()
+				if se.FilterDocs[filterKey] == nil {
+					se.FilterDocs[filterKey] = make(map[uint32]bool)
+				}
+				se.FilterDocs[filterKey][internalID] = true
+				se.mu.Unlock()
+			}
+		}
+	}
 
 	return se, nil
 }
 
+// -------------------- Indexing --------------------
+
 // Index performs a full (re)index pass for the provided docs and logs timings.
 //
-// The steps are:
-//  1. InsertDocs        — materialize raw documents
+// Steps:
+//  1. InsertDocs        — assign internal IDs & store docs (updates create new internalID and delete old)
 //  2. BuildDocumentIndex— tokenize/update inverted index & filters
-//  3. BuildScoreIndex   — build per-term sorted postings
-func (se *SearchEngine) Index(shardID int, docs []map[string]interface{}) {
+func (se *SearchEngine) Index(docs []map[string]interface{}) {
 	fmt.Println("Insert documents starting...")
 	start := time.Now()
 	se.InsertDocs(docs)
-	duration := time.Since(start)
-	fmt.Printf("Insert documents took: %s\n", duration)
+	fmt.Printf("Insert documents took: %s\n", time.Since(start))
 
 	fmt.Println("BuildDocumentIndex starting...")
 	start = time.Now()
 	se.BuildDocumentIndex(docs)
-	duration = time.Since(start)
-	fmt.Printf("BuildDocumentIndex took: %s\n", duration)
-
-	fmt.Println("BuildScoreIndex starting...")
-	start = time.Now()
-	se.BuildScoreIndex()
-	duration = time.Since(start)
-	fmt.Printf("BuildScoreIndex took: %s\n", duration)
-}
-
-// BuildScoreIndex (re)constructs ScoreIndex by sorting each term's postings
-// descending by weight. It parallelizes over available CPUs.
-func (se *SearchEngine) BuildScoreIndex() {
-	se.mu.RLock()
-	keys := make([]string, 0, len(se.Data))
-	for k := range se.Data {
-		keys = append(keys, k)
-	}
-	se.mu.RUnlock()
-
-	workers := runtime.NumCPU()
-	var wg sync.WaitGroup
-	keysCh := make(chan string, len(keys))
-
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for key := range keysCh {
-				var tempArr []Document
-
-				se.mu.RLock()
-				for docID, weight := range se.Data[key] {
-					tempArr = append(tempArr, Document{
-						ID:          docID,
-						ScoreWeight: weight,
-						Data:        se.Documents[docID],
-					})
-				}
-				se.mu.RUnlock()
-
-				sort.Slice(tempArr, func(i, j int) bool {
-					return tempArr[i].ScoreWeight > tempArr[j].ScoreWeight
-				})
-
-				se.mu.Lock()
-				se.ScoreIndex[key] = tempArr
-				se.mu.Unlock()
-			}
-		}()
-	}
-
-	for _, k := range keys {
-		keysCh <- k
-	}
-	close(keysCh)
-	wg.Wait()
+	fmt.Printf("BuildDocumentIndex took: %s\n", time.Since(start))
 }
 
 // InsertDocs materializes raw documents into the Documents store without reindexing.
-//
-// If a document with the same id already exists, it is left intact (no overwrite).
 func (se *SearchEngine) InsertDocs(docs []map[string]interface{}) {
+	workers := runtime.NumCPU()
+	jobs := make(chan map[string]interface{}, workers*2)
+	var wg sync.WaitGroup
+
+	worker := func() {
+		defer wg.Done()
+		for doc := range jobs {
+			rawID, ok := doc["id"]
+			if !ok || rawID == nil {
+				continue
+			}
+			extID := fmt.Sprintf("%v", rawID)
+			if extID == "" || extID == "<nil>" {
+				continue
+			}
+
+			se.mu.Lock()
+
+			// delete previous internal doc if exists
+			if oldInternal, exists := se.ExternalToInternal[extID]; exists {
+				se.DocDeleted[oldInternal] = true
+			}
+
+			// assign new internal id
+			internal := se.nextInternalID
+			se.nextInternalID++
+
+			se.ExternalToInternal[extID] = internal
+			se.InternalToExternal[internal] = extID
+
+			se.Documents[internal] = make(map[string]interface{}, len(doc))
+			for k, v := range doc {
+				se.Documents[internal][k] = v
+			}
+
+			se.mu.Unlock()
+		}
+	}
+
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go worker()
+	}
+
 	for i, doc := range docs {
 		if i%100_000 == 0 || i == len(docs)-1 {
 			fmt.Println("InsertDocs:", i)
 		}
-
-		rawID, ok := doc["id"]
-		if !ok || rawID == nil {
-			// No usable ID; skip safely.
-			continue
-		}
-		docID := fmt.Sprintf("%v", rawID)
-		if docID == "" || docID == "<nil>" {
-			continue
-		}
-
-		se.mu.Lock()
-		if _, exists := se.Documents[docID]; !exists {
-			se.Documents[docID] = make(map[string]interface{})
-			for k, v := range doc {
-				se.Documents[docID][k] = v
-			}
-		}
-		se.mu.Unlock()
+		jobs <- doc
 	}
+
+	close(jobs)
+	wg.Wait()
 }
 
 // BuildDocumentIndex tokenizes index fields and updates the inverted index and filters.
-//
-// Indexing:
-//   - Tokenization is done by Tokenize (lowercase, strip non-alnum, drop stopwords).
-//   - Each token contributes a normalized weight = 100_000 / total_token_count.
-//
-// Filters:
-//   - For each configured filter field, creates a key "field:value" -> set(docID).
 func (se *SearchEngine) BuildDocumentIndex(docs []map[string]interface{}) {
-	for i, doc := range docs {
-		if i%100_000 == 0 || i == len(docs)-1 {
-			fmt.Println("BuildDocumentIndex Document:", i)
-		}
+	workers := runtime.NumCPU()
+	jobs := make(chan map[string]interface{}, workers*2)
+	var wg sync.WaitGroup
 
-		rawID, ok := doc["id"]
-		if !ok || rawID == nil {
-			continue
-		}
-		docID := fmt.Sprintf("%v", rawID)
-		if docID == "" || docID == "<nil>" {
-			continue
-		}
+	worker := func() {
+		defer wg.Done()
 
-		var allTokens []string
-		for _, weightField := range se.IndexFields {
-			if value, exists := doc[weightField]; exists {
-				switch v := value.(type) {
-				case string:
-					tokens := Tokenize(v)
-					allTokens = append(allTokens, tokens...)
-				case []string:
-					for _, item := range v {
-						tokens := Tokenize(item)
-						allTokens = append(allTokens, tokens...)
-					}
-				case []interface{}:
-					for _, item := range v {
-						if str, ok := item.(string); ok {
-							tokens := Tokenize(str)
-							allTokens = append(allTokens, tokens...)
+		for doc := range jobs {
+			rawID, ok := doc["id"]
+			if !ok || rawID == nil {
+				continue
+			}
+			extID := fmt.Sprintf("%v", rawID)
+			if extID == "" || extID == "<nil>" {
+				continue
+			}
+
+			// resolve current internal id for this external id
+			se.mu.RLock()
+			internal, ok := se.ExternalToInternal[extID]
+			deleted := ok && se.DocDeleted[internal]
+			indexFields := se.IndexFields
+			filters := se.Filters
+			se.mu.RUnlock()
+
+			if !ok || deleted {
+				continue
+			}
+
+			// ---- tokenize first (no locks) ----
+			var allTokens []string
+			for _, weightField := range indexFields {
+				if value, exists := doc[weightField]; exists {
+					switch v := value.(type) {
+					case string:
+						allTokens = append(allTokens, Tokenize(v)...)
+					case []string:
+						for _, item := range v {
+							allTokens = append(allTokens, Tokenize(item)...)
+						}
+					case []interface{}:
+						for _, item := range v {
+							if str, ok := item.(string); ok {
+								allTokens = append(allTokens, Tokenize(str)...)
+							}
 						}
 					}
 				}
 			}
-		}
 
-		for _, token := range allTokens {
-			se.addToDocumentIndex(token, docID, len(allTokens))
-		}
+			// ---- index tokens ----
+			for _, token := range allTokens {
+				se.addToDocumentIndex(token, internal, len(allTokens))
+			}
 
-		for field := range se.Filters {
-			if value, exists := doc[field]; exists {
-				switch v := value.(type) {
-				case int, int8, int16, int32, int64, float32, float64:
-					filterKey := fmt.Sprintf("%s:%v", field, v)
-					se.mu.Lock()
-					if se.FilterDocs[filterKey] == nil {
-						se.FilterDocs[filterKey] = make(map[string]bool)
+			// ---- filters ----
+			for field := range filters {
+				if value, exists := doc[field]; exists {
+					switch v := value.(type) {
+					case int, int8, int16, int32, int64, float32, float64:
+						filterKey := fmt.Sprintf("%s:%v", field, v)
+						se.mu.Lock()
+						if se.FilterDocs[filterKey] == nil {
+							se.FilterDocs[filterKey] = make(map[uint32]bool)
+						}
+						se.FilterDocs[filterKey][internal] = true
+						se.mu.Unlock()
+					case string:
+						filterKey := fmt.Sprintf("%s:%s", field, v)
+						se.mu.Lock()
+						if se.FilterDocs[filterKey] == nil {
+							se.FilterDocs[filterKey] = make(map[uint32]bool)
+						}
+						se.FilterDocs[filterKey][internal] = true
+						se.mu.Unlock()
 					}
-					se.FilterDocs[filterKey][docID] = true
-					se.mu.Unlock()
-				case string:
-					filterKey := fmt.Sprintf("%s:%s", field, v)
-					se.mu.Lock()
-					if se.FilterDocs[filterKey] == nil {
-						se.FilterDocs[filterKey] = make(map[string]bool)
-					}
-					se.FilterDocs[filterKey][docID] = true
-					se.mu.Unlock()
 				}
 			}
 		}
 	}
+
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go worker()
+	}
+
+	for i, doc := range docs {
+		if i%100_000 == 0 || i == len(docs)-1 {
+			fmt.Println("BuildDocumentIndex Document:", i)
+		}
+		jobs <- doc
+	}
+
+	close(jobs)
+	wg.Wait()
 }
 
-// addToDocumentIndex adds/updates a term->docID weight and seeds Keys/Trie/SymSpell
-// when encountering the term for the first time.
-//
-// Weighting: normalizedWeight := 100_000 / document_token_count.
-func (se *SearchEngine) addToDocumentIndex(
-	term, docID string, length int,
-) {
-	// TODO: Consider adding a "popularity" prior and bias normalizedWeight accordingly.
-	normalizedWeight := (100_000 / length)
+// addToDocumentIndex adds/updates a term->internalDocID posting and seeds Keys/SymSpell/Prefix.
+func (se *SearchEngine) addToDocumentIndex(term string, internalDocID uint32, length int) {
+	if length <= 0 {
+		return
+	}
+	normalizedScore := (100_000 / length)
 
 	se.mu.Lock()
 	defer se.mu.Unlock()
 
-	docMap, ok := se.Data[term]
+	if se.DocDeleted[internalDocID] {
+		return
+	}
+
+	docMap, ok := se.DataMap[term]
 	if !ok {
 		se.Keys.Insert(term)
-		// se.Trie.Insert(term)
 		se.Symspell.AddWord(term)
-		docMap = make(map[string]int)
-		se.Data[term] = docMap
 
-		for i := 1; i < len(term); i++ {
-			if len(se.Prefix[term[0:i]]) >= MaxPrefixTerms {
-				continue
-			}
-			se.Prefix[term[0:i]] = append(se.Prefix[term[0:i]], term)
+		if se.Prefix == nil {
+			se.Prefix = make(map[string][]string)
 		}
 		if len(se.Prefix[term]) < MaxPrefixTerms {
 			se.Prefix[term] = append(se.Prefix[term], term)
 		}
+		for i := 1; i < len(term); i++ {
+			pfx := term[0:i]
+			if len(se.Prefix[pfx]) >= MaxPrefixTerms {
+				continue
+			}
+			se.Prefix[pfx] = append(se.Prefix[pfx], term)
+		}
+
+		docMap = make(map[uint32]int)
+		se.DataMap[term] = docMap
 	}
-	docMap[docID] += normalizedWeight
+
+	docMap[internalDocID] += normalizedScore
 }
 
-// SearchOneTermWithoutFilter retrieves a page of results for a single term
-// using the prebuilt ScoreIndex. Returns nil when the requested page is empty.
-func (se *SearchEngine) SearchOneTermWithoutFilter(query string, page int) []Document {
+// -------------------- Search --------------------
+
+// SearchOneTermWithoutFilter retrieves a page of results for a single term.
+// Search holds RLock for the whole function to avoid concurrent map read/write panics.
+func (se *SearchEngine) SearchOneTermWithoutFilter(query string, page int) []ReturnedDocument {
 	se.mu.RLock()
 	defer se.mu.RUnlock()
 
-	lastIndex := page * se.PageSize
-	if lastIndex >= len(se.ScoreIndex[query]) {
+	postingsByDoc := se.DataMap[query]
+	if postingsByDoc == nil {
 		return nil
 	}
-	stop := lastIndex + se.PageSize
-	if stop > len(se.ScoreIndex[query]) {
-		stop = len(se.ScoreIndex[query])
+
+	start := page * se.PageSize
+	end := start + se.PageSize
+
+	hits := make([]internalHit, 0)
+
+	for internalID, score := range postingsByDoc {
+		if se.DocDeleted[internalID] {
+			continue
+		}
+
+		hits = append(hits, internalHit{id: internalID, score: score})
 	}
-	return se.ScoreIndex[query][lastIndex:stop]
+
+	if len(hits) == 0 {
+		return nil
+	}
+
+	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
+
+	if start >= len(hits) {
+		return nil
+	}
+	if end > len(hits) {
+		end = len(hits)
+	}
+
+	out := make([]ReturnedDocument, 0, end-start)
+	for _, hit := range hits[start:end] {
+		extID := se.InternalToExternal[hit.id]
+		out = append(out, ReturnedDocument{
+			ID:    extID,
+			Data:  se.Documents[hit.id],
+			Score: hit.score,
+		})
+	}
+	return out
 }
 
-// ApplyFilter returns the set of docIDs that satisfy the given filters.
+// SearchOneTermWithFilter retrieves a page of results for a single term, applying filters.
+// If filters is nil/empty, it falls back to SearchOneTermWithoutFilter.
+func (se *SearchEngine) SearchOneTermWithFilter(query string, page int, filters map[string][]interface{}) []ReturnedDocument {
+	if len(filters) == 0 {
+		return se.SearchOneTermWithoutFilter(query, page)
+	}
+
+	allowed := se.ApplyFilter(filters)
+	if len(allowed) == 0 {
+		return nil
+	}
+
+	se.mu.RLock()
+	defer se.mu.RUnlock()
+
+	postingsByDoc := se.DataMap[query]
+	if postingsByDoc == nil {
+		return nil
+	}
+
+	start := page * se.PageSize
+	end := start + se.PageSize
+
+	hits := make([]internalHit, 0)
+
+	for internalID, score := range postingsByDoc {
+		if se.DocDeleted[internalID] {
+			continue
+		}
+		if !allowed[internalID] {
+			continue
+		}
+		hits = append(hits, internalHit{id: internalID, score: score})
+	}
+
+	if len(hits) == 0 {
+		return nil
+	}
+
+	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
+
+	if start >= len(hits) {
+		return nil
+	}
+	if end > len(hits) {
+		end = len(hits)
+	}
+
+	out := make([]ReturnedDocument, 0, end-start)
+	for _, hit := range hits[start:end] {
+		out = append(out, ReturnedDocument{
+			ID:    se.InternalToExternal[hit.id],
+			Data:  se.Documents[hit.id],
+			Score: hit.score,
+		})
+	}
+	return out
+}
+
+// SearchMultipleTermsWithoutFilter executes AND across groups and OR within group.
+// Search holds RLock for the whole function to avoid concurrent map read/write panics.
+func (se *SearchEngine) SearchMultipleTermsWithoutFilter(termArrList [][]string, page int) []ReturnedDocument {
+	if len(termArrList) == 0 {
+		return nil
+	}
+
+	se.mu.RLock()
+	defer se.mu.RUnlock()
+
+	groups := make([][]map[uint32]int, len(termArrList))
+	groupSizes := make([]int, len(termArrList))
+
+	for i, terms := range termArrList {
+		if len(terms) == 0 {
+			return nil
+		}
+
+		group := make([]map[uint32]int, 0, len(terms))
+		sizeSum := 0
+
+		for _, term := range terms {
+			if m := se.DataMap[term]; m != nil {
+				group = append(group, m)
+				sizeSum += len(m)
+			}
+		}
+
+		if len(group) == 0 {
+			return nil
+		}
+
+		groups[i] = group
+		groupSizes[i] = sizeSum
+	}
+
+	// Choose anchor group (most selective by rough size estimate)
+	anchorIdx := 0
+	anchorSize := groupSizes[0]
+	for i := 1; i < len(groupSizes); i++ {
+		if groupSizes[i] < anchorSize {
+			anchorSize = groupSizes[i]
+			anchorIdx = i
+		}
+	}
+	anchorGroup := groups[anchorIdx]
+
+	start := page * se.PageSize
+	end := start + se.PageSize
+
+	visited := make(map[uint32]struct{}, anchorSize)
+
+	hits := make([]internalHit, 0)
+
+	for _, anchorMap := range anchorGroup {
+		for internalID, score := range anchorMap {
+			if _, seen := visited[internalID]; seen {
+				continue
+			}
+			visited[internalID] = struct{}{}
+
+			if se.DocDeleted[internalID] {
+				continue
+			}
+
+			total := score
+			valid := true
+
+			// AND across groups, OR within group
+			for gi, group := range groups {
+				if gi == anchorIdx {
+					continue
+				}
+
+				found := false
+				for _, m := range group {
+					if s, ok := m[internalID]; ok {
+						total += s
+						found = true
+						break
+					}
+				}
+
+				if !found {
+					valid = false
+					break
+				}
+			}
+
+			if !valid {
+				continue
+			}
+
+			hits = append(hits, internalHit{id: internalID, score: total})
+		}
+	}
+	if len(hits) == 0 {
+		return nil
+	}
+
+	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
+
+	if start >= len(hits) {
+		return nil
+	}
+	if end > len(hits) {
+		end = len(hits)
+	}
+
+	out := make([]ReturnedDocument, 0, end-start)
+	for _, hit := range hits[start:end] {
+		out = append(out, ReturnedDocument{
+			ID:    se.InternalToExternal[hit.id],
+			Data:  se.Documents[hit.id],
+			Score: hit.score,
+		})
+	}
+	return out
+}
+
+// SearchMultiTermsWithFilter executes AND across groups and OR within group, applying filters.
+// If filters is nil/empty, it falls back to SearchMultipleTermsWithoutFilter.
+func (se *SearchEngine) SearchMultiTermsWithFilter(termArrList [][]string, page int, filters map[string][]interface{}) []ReturnedDocument {
+	if len(filters) == 0 {
+		return se.SearchMultipleTermsWithoutFilter(termArrList, page)
+	}
+
+	allowed := se.ApplyFilter(filters)
+	if len(allowed) == 0 {
+		return nil
+	}
+
+	if len(termArrList) == 0 {
+		return nil
+	}
+
+	se.mu.RLock()
+	defer se.mu.RUnlock()
+
+	groups := make([][]map[uint32]int, len(termArrList))
+	groupSizes := make([]int, len(termArrList))
+
+	for i, terms := range termArrList {
+		if len(terms) == 0 {
+			return nil
+		}
+
+		group := make([]map[uint32]int, 0, len(terms))
+		sizeSum := 0
+
+		for _, term := range terms {
+			if m := se.DataMap[term]; m != nil {
+				group = append(group, m)
+				sizeSum += len(m)
+			}
+		}
+
+		if len(group) == 0 {
+			return nil
+		}
+
+		groups[i] = group
+		groupSizes[i] = sizeSum
+	}
+
+	// Choose anchor group (most selective by rough size estimate)
+	anchorIdx := 0
+	anchorSize := groupSizes[0]
+	for i := 1; i < len(groupSizes); i++ {
+		if groupSizes[i] < anchorSize {
+			anchorSize = groupSizes[i]
+			anchorIdx = i
+		}
+	}
+	anchorGroup := groups[anchorIdx]
+
+	start := page * se.PageSize
+	end := start + se.PageSize
+
+	visited := make(map[uint32]struct{}, anchorSize)
+	hits := make([]internalHit, 0)
+
+	for _, anchorMap := range anchorGroup {
+		for internalID, score := range anchorMap {
+			if _, seen := visited[internalID]; seen {
+				continue
+			}
+			visited[internalID] = struct{}{}
+
+			if !allowed[internalID] {
+				continue
+			}
+			if se.DocDeleted[internalID] {
+				continue
+			}
+
+			total := score
+			valid := true
+
+			// AND across groups, OR within group
+			for gi, group := range groups {
+				if gi == anchorIdx {
+					continue
+				}
+
+				found := false
+				for _, m := range group {
+					if s, ok := m[internalID]; ok {
+						total += s
+						found = true
+						break
+					}
+				}
+
+				if !found {
+					valid = false
+					break
+				}
+			}
+
+			if !valid {
+				continue
+			}
+
+			hits = append(hits, internalHit{id: internalID, score: total})
+		}
+	}
+
+	if len(hits) == 0 {
+		return nil
+	}
+
+	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
+
+	if start >= len(hits) {
+		return nil
+	}
+	if end > len(hits) {
+		end = len(hits)
+	}
+
+	out := make([]ReturnedDocument, 0, end-start)
+	for _, hit := range hits[start:end] {
+		out = append(out, ReturnedDocument{
+			ID:    se.InternalToExternal[hit.id],
+			Data:  se.Documents[hit.id],
+			Score: hit.score,
+		})
+	}
+	return out
+}
+
+// ApplyFilter returns the set of internal docIDs that satisfy the given filters.
 // Semantics: OR within a field's values, AND across different fields.
-// Example: {year:[2020,2021], type:["song"]} ⇒ docs where (year=2020 OR year=2021) AND (type="song").
-func (se *SearchEngine) ApplyFilter(filters map[string][]interface{}) map[string]bool {
+func (se *SearchEngine) ApplyFilter(filters map[string][]interface{}) map[uint32]bool {
 	if len(filters) == 0 {
 		return nil
 	}
 
-	var result map[string]bool
+	se.mu.RLock()
+	defer se.mu.RUnlock()
+
+	var result map[uint32]bool
 	firstField := true
 
 	for field, values := range filters {
-		// Union of all values for this field
-		fieldUnion := make(map[string]bool)
+		fieldUnion := make(map[uint32]bool)
 		for _, v := range values {
 			key := fmt.Sprintf("%s:%v", field, v)
-
-			se.mu.RLock()
 			docs := se.FilterDocs[key]
-			se.mu.RUnlock()
-
-			for docID := range docs {
-				fieldUnion[docID] = true
+			for internalID := range docs {
+				if se.DocDeleted[internalID] {
+					continue
+				}
+				fieldUnion[internalID] = true
 			}
 		}
 
-		// First field initializes the result; subsequent fields intersect.
 		if firstField {
 			result = fieldUnion
 			firstField = false
 			continue
 		}
 
-		// Intersection: keep only IDs present in both result and fieldUnion.
-		for docID := range result {
-			if !fieldUnion[docID] {
-				delete(result, docID)
+		for internalID := range result {
+			if !fieldUnion[internalID] {
+				delete(result, internalID)
 			}
 		}
 
-		// Early exit if intersection is empty.
 		if len(result) == 0 {
 			break
 		}
@@ -496,216 +921,34 @@ func (se *SearchEngine) ApplyFilter(filters map[string][]interface{}) map[string
 	return result
 }
 
-// SearchOneTermWithFilter retrieves a page of results for a single term while
-// applying the filter constraints. Returns up to PageSize documents.
-func (se *SearchEngine) SearchOneTermWithFilter(query string, filters map[string][]interface{}, page int) []Document {
-	filteredDocs := se.ApplyFilter(filters)
-	lastIndex := page * se.PageSize
-	if lastIndex >= len(filteredDocs) {
-		return nil
-	}
-
-	se.mu.RLock()
-	termDocs := se.ScoreIndex[query]
-	se.mu.RUnlock()
-	if lastIndex >= len(termDocs) {
-		return nil
-	}
-
-	var finalDocs []Document
-	counter := 0
-
-	// NOTE: This scans ScoreIndex[query] and counts only those in filtered set.
-	// Returning/accepting a "resume cursor" would avoid rescanning earlier pages.
-	for i := 0; i < len(termDocs); i++ {
-		if _, ok := filteredDocs[termDocs[i].ID]; ok {
-			finalDocs = append(finalDocs, termDocs[i])
-			counter++
-			if counter == lastIndex+se.PageSize {
-				return finalDocs[lastIndex:]
-			}
-		}
-	}
-
-	if lastIndex >= len(finalDocs) {
-		return nil
-	}
-
-	return finalDocs[lastIndex:]
-}
-
-// SearchMultipleTerms executes a multi-term search with optional last-term prefix guesses.
-//
-// Strategy:
-//   - Choose the rarest "first term" (smallest postings list) as the driving term.
-//   - Require the document to contain all other "first terms".
-//   - Optionally accept any of lastTermGuessArr (any-match).
-//   - Accumulate total score across matched terms.
-//
-// Pagination is handled by slicing the accumulated results.
-func (se *SearchEngine) SearchMultipleTerms(
-	ctx context.Context,
-	firstTerms []string,
-	lastTermGuessArr []string,
-	filters map[string][]interface{},
-	page int,
-) []Document {
-
-	if len(firstTerms) == 0 {
-		return nil
-	}
-
-	// ---- filters
-	var filteredDocs map[string]struct{}
-	if len(filters) > 0 {
-		tmp := se.ApplyFilter(filters)
-		filteredDocs = make(map[string]struct{}, len(tmp))
-		for id := range tmp {
-			filteredDocs[id] = struct{}{}
-		}
-	}
-
-	se.mu.RLock()
-	defer se.mu.RUnlock()
-
-	// scoreIndex := se.ScoreIndex
-	// data := se.Data
-	// documents := se.Documents
-	// pageSize := se.PageSize
-
-	inputTerm := firstTerms[0]
-	for _, t := range firstTerms[1:] {
-		if len(se.ScoreIndex[t]) < len(se.ScoreIndex[inputTerm]) {
-			inputTerm = t
-		}
-	}
-
-	startIndex := page * se.PageSize
-	stopIndex := startIndex + se.PageSize
-
-	// ---- pre-resolve maps
-	exactMaps := make([]map[string]int, 0, len(firstTerms)-1)
-	for _, t := range firstTerms {
-		if t != inputTerm {
-			exactMaps = append(exactMaps, se.Data[t])
-		}
-	}
-
-	guessMaps := make([]map[string]int, 0, len(lastTermGuessArr))
-	for _, t := range lastTermGuessArr {
-		if m := se.Data[t]; m != nil {
-			guessMaps = append(guessMaps, m)
-		}
-	}
-
-	// ---- collect hits
-	type hit struct {
-		id    string
-		score int
-	}
-	hits := make([]hit, 0, stopIndex)
-
-outer:
-	for _, doc := range se.ScoreIndex[inputTerm] {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
-
-		if filteredDocs != nil {
-			if _, ok := filteredDocs[doc.ID]; !ok {
-				continue
-			}
-		}
-
-		totalScore := doc.ScoreWeight
-
-		for _, m := range exactMaps {
-			w, ok := m[doc.ID]
-			if !ok {
-				continue outer
-			}
-			totalScore += w
-		}
-
-		if len(guessMaps) > 0 {
-			found := false
-			for _, m := range guessMaps {
-				if w, ok := m[doc.ID]; ok {
-					totalScore += w
-					found = true
-					break
-				}
-			}
-			if !found {
-				continue
-			}
-		}
-
-		hits = append(hits, hit{id: doc.ID, score: totalScore})
-		if len(hits) >= stopIndex {
-			break // safe because scoreIndex is score-sorted
-		}
-	}
-
-	if startIndex >= len(hits) {
-		return nil
-	}
-
-	if stopIndex > len(hits) {
-		stopIndex = len(hits)
-	}
-
-	// ---- hydrate only the page
-	out := make([]Document, 0, stopIndex-startIndex)
-	for _, h := range hits[startIndex:stopIndex] {
-		out = append(out, Document{
-			ID:          h.id,
-			Data:        se.Documents[h.id],
-			ScoreWeight: h.score,
-		})
-	}
-
-	return out
-}
-
-// Search executes a query (single or multi-term), selecting between exact/prefix/fuzzy
-// strategies and honoring filters. searchStep controls fallback behavior for multi-term
-// queries (see MultiTermSearch).
-func (se *SearchEngine) Search(ctx context.Context, query string, page int, filters map[string][]interface{}, searchStep int) *SearchResult {
-	select {
-	case <-ctx.Done():
-		return nil
-	default:
-	}
-
+// Search executes a query (single or multi-term), selecting between exact/prefix/fuzzy strategies.
+func (se *SearchEngine) Search(query string, page int, filters map[string][]interface{}) *SearchResult {
 	queryTokens := Tokenize(query)
 	if len(queryTokens) == 0 {
 		return nil
 	} else if len(queryTokens) == 1 {
 		return se.SingleTermSearch(queryTokens, page, filters)
 	} else {
-		return se.MultiTermSearch(ctx, queryTokens, page, filters, searchStep)
+		return se.MultiTermSearch(queryTokens, page, filters)
 	}
 }
 
-// SingleTermSearch resolves a single-token query via prefix (preferred) or fuzzy
-// expansions, and applies filters if provided.
+// SingleTermSearch resolves a single-token query via prefix (preferred) or fuzzy expansions.
+// Filter behavior preserved: your original SingleTermSearch ignored filters in else-block.
 func (se *SearchEngine) SingleTermSearch(queryTokens []string, page int, filters map[string][]interface{}) *SearchResult {
 	parsedQuery := make(map[string][]string)
 	maxToken := 3
+
 	se.mu.RLock()
-	prefixTokens := se.Prefix[queryTokens[0]]
+	prefixTokens := append([]string(nil), se.Prefix[queryTokens[0]]...)
 	se.mu.RUnlock()
+
 	if len(prefixTokens) < maxToken {
 		maxToken = len(prefixTokens)
 	}
-	se.mu.RLock()
-	guessArr := se.Prefix[queryTokens[0]][:maxToken]
-	se.mu.RUnlock()
-	// guessArr := se.Trie.SearchPrefix(queryTokens[0], 3)
-	if guessArr != nil {
+	guessArr := prefixTokens[:maxToken]
+
+	if len(guessArr) > 0 {
 		parsedQuery["prefix"] = append(parsedQuery["prefix"], guessArr...)
 	} else {
 		fuzzyWords := se.Symspell.FuzzySearch(queryTokens[0], 3)
@@ -715,321 +958,221 @@ func (se *SearchEngine) SingleTermSearch(queryTokens []string, page int, filters
 			parsedQuery["fuzzy"] = append(parsedQuery["fuzzy"], queryTokens[0])
 		}
 	}
-	var finalDocs []Document
-	if len(filters) == 0 {
-		if parsedQuery["prefix"] != nil {
-			for _, query := range parsedQuery["prefix"] {
-				finalDocs = append(finalDocs, se.SearchOneTermWithoutFilter(query, page)...)
-			}
-			return &SearchResult{
-				Docs:            finalDocs,
-				IsMultiTerm:     false,
-				IsFuzzy:         false,
-				IsPrefixOrExact: true,
-			}
-		} else if parsedQuery["fuzzy"] != nil {
-			for _, query := range parsedQuery["fuzzy"] {
-				finalDocs = append(finalDocs, se.SearchOneTermWithoutFilter(query, page)...)
-			}
-			return &SearchResult{
-				Docs:            finalDocs,
-				IsMultiTerm:     false,
-				IsFuzzy:         true,
-				IsPrefixOrExact: false,
+
+	var finalDocs []ReturnedDocument
+	if parsedQuery["prefix"] != nil {
+		for _, q := range parsedQuery["prefix"] {
+			if len(filters) > 0 {
+				finalDocs = append(finalDocs, se.SearchOneTermWithFilter(q, page, filters)...)
+			} else {
+				finalDocs = append(finalDocs, se.SearchOneTermWithoutFilter(q, page)...)
 			}
 		}
-	} else {
-		if parsedQuery["prefix"] != nil {
-			for _, query := range parsedQuery["prefix"] {
-				finalDocs = append(finalDocs, se.SearchOneTermWithFilter(query, filters, page)...)
-			}
-			return &SearchResult{
-				Docs:            finalDocs,
-				IsMultiTerm:     false,
-				IsFuzzy:         false,
-				IsPrefixOrExact: true,
-			}
-		} else if parsedQuery["fuzzy"] != nil {
-			for _, query := range parsedQuery["fuzzy"] {
-				finalDocs = append(finalDocs, se.SearchOneTermWithFilter(query, filters, page)...)
-			}
-			return &SearchResult{
-				Docs:            finalDocs,
-				IsMultiTerm:     false,
-				IsFuzzy:         true,
-				IsPrefixOrExact: false,
-			}
-		}
+		return &SearchResult{Docs: finalDocs}
 	}
+	if parsedQuery["fuzzy"] != nil {
+		for _, q := range parsedQuery["fuzzy"] {
+			if len(filters) > 0 {
+				finalDocs = append(finalDocs, se.SearchOneTermWithFilter(q, page, filters)...)
+			} else {
+				finalDocs = append(finalDocs, se.SearchOneTermWithoutFilter(q, page)...)
+			}
+		}
+		return &SearchResult{Docs: finalDocs}
+	}
+
 	return nil
 }
 
-// MultiTermSearch handles multi-token queries with staged fallbacks controlled
-// by searchStep:
-//
-//	0 (primary): fuzzy-correct all but the last token (1 suggestion each);
-//	             expand last token with up to 50 prefix candidates.
-//	1 (fallback): for each of the first tokens, try up to 50 fuzzy variants,
-//	             and restrict last token to 50 prefix candidates; return on first hit.
-//	2 (fallback): ignore last-term guessing; require documents to match the
-//	             fuzzy-corrected "first terms" only.
-func (se *SearchEngine) MultiTermSearch(ctx context.Context, queryTokens []string, page int, filters map[string][]interface{}, searchStep int) *SearchResult {
-	switch searchStep {
-	case 0:
-		// 1st search: prefix-expand last term; fuzzy-correct earlier terms (1 each).
-		// start := time.Now()
-		se.mu.RLock()
-		lastTermGuessArr := se.Prefix[queryTokens[len(queryTokens)-1]]
-		se.mu.RUnlock()
-		// lastTermGuessArr := se.Trie.SearchPrefix(queryTokens[len(queryTokens)-1], 250)
-		// duration := time.Since(start)
-		// fmt.Printf("Shard: %d, SearchPrefix %s, lastTermGuessArr: %v, duration: %s\n", se.ShardID, queryTokens[len(queryTokens)-1], lastTermGuessArr, duration)
-
-		// start = time.Now()
-		isFuzzy := false
-		var firstTerms []string
-		for _, firstTerm := range queryTokens[:len(queryTokens)-1] {
-			_, ok := se.Keys.GetData()[firstTerm]
-			if ok {
-				firstTerms = append(firstTerms, firstTerm)
-			} else {
-				fuzzyWords := se.Symspell.FuzzySearch(firstTerm, 1)
-				if len(fuzzyWords) > 0 {
-					firstTerms = append(firstTerms, fuzzyWords[0])
-				} else {
-					firstTerms = append(firstTerms, firstTerm)
-				}
-				isFuzzy = true
-			}
+// MultiTermSearch executes a multi-token query using grouped boolean search strategies.
+// Filter behavior preserved (original multi-term path did not apply filters).
+func (se *SearchEngine) MultiTermSearch(queryTokens []string, page int, filters map[string][]interface{}) *SearchResult {
+	returnedDocuments := make([]ReturnedDocument, 0, se.PageSize)
+	iteration := 1
+	maxIteration := 1
+	for {
+		returnedDocuments = append(returnedDocuments, se.multiTermSearchIteration(iteration, queryTokens, page, filters)...)
+		if len(returnedDocuments) >= se.PageSize*(page+1) || iteration >= maxIteration {
+			break
 		}
-
-		// duration = time.Since(start)
-		// fmt.Printf("Shard: %d, FirstTerm: %s\n", se.ShardID, duration)
-
-		// start = time.Now()
-		finalDocs := se.SearchMultipleTerms(ctx, firstTerms, lastTermGuessArr, filters, page)
-		// duration = time.Since(start)
-		// fmt.Printf("Shard: %d, SearchMultipleTerms: %s\n", se.ShardID, duration)
-
-		return &SearchResult{
-			Docs:            finalDocs,
-			IsMultiTerm:     true,
-			IsFuzzy:         isFuzzy,
-			IsPrefixOrExact: false,
-		}
-	case 1:
-		// 2nd search: broaden fuzzies for earlier tokens; narrow last-term prefixes.
-		// lastTermGuessArr := se.Trie.SearchPrefix(queryTokens[len(queryTokens)-1], 50)
-		lastTermGuessArr := se.Symspell.FuzzySearch(queryTokens[len(queryTokens)-1], 50)
-
-		for k, queryToken := range queryTokens[:len(queryTokens)-1] {
-			firstTermFuzzies := se.Symspell.FuzzySearch(queryToken, 50)
-			firstTerms := make([]string, len(queryTokens)-1)
-			copy(firstTerms, queryTokens[:len(queryTokens)-1])
-			for _, firstTermFuzzy := range firstTermFuzzies {
-				firstTerms[k] = firstTermFuzzy
-				finalDocs := se.SearchMultipleTerms(ctx, firstTerms, lastTermGuessArr, filters, page)
-				if len(finalDocs) > 0 {
-					return &SearchResult{
-						Docs:            finalDocs,
-						IsMultiTerm:     true,
-						IsFuzzy:         false,
-						IsPrefixOrExact: false,
-					}
-				}
-			}
-		}
-		return &SearchResult{
-			Docs:            []Document{},
-			IsMultiTerm:     true,
-			IsFuzzy:         false,
-			IsPrefixOrExact: false,
-		}
-	case 2:
-		// 3rd search: drop last-term guessing; require only first-term matches.
-		var firstTerms []string
-		for _, firstTerm := range queryTokens[:len(queryTokens)-1] {
-			_, ok := se.Keys.GetData()[firstTerm]
-			if ok {
-				firstTerms = append(firstTerms, firstTerm)
-			} else {
-				fuzzyWords := se.Symspell.FuzzySearch(firstTerm, 1)
-				if len(fuzzyWords) > 0 {
-					firstTerms = append(firstTerms, fuzzyWords[0])
-				} else {
-					firstTerms = append(firstTerms, firstTerm)
-				}
-			}
-		}
-		finalDocs := se.SearchMultipleTerms(ctx, firstTerms, nil, filters, page)
-		return &SearchResult{
-			Docs:            finalDocs,
-			IsMultiTerm:     true,
-			IsFuzzy:         false,
-			IsPrefixOrExact: false,
-		}
+		iteration++
 	}
-	return nil
+
+	sort.Slice(returnedDocuments, func(i, j int) bool {
+		if returnedDocuments[i].Score != returnedDocuments[j].Score {
+			return returnedDocuments[i].Score > returnedDocuments[j].Score
+		}
+		return returnedDocuments[i].ID < returnedDocuments[j].ID
+	})
+
+	return &SearchResult{Docs: returnedDocuments}
 }
 
-// addScoreIndex inserts or updates score entries for a document across tokens,
-// keeping each token’s ScoreIndex slice sorted in descending ScoreWeight.
-//
-// This is used for incremental adds (see addDocument); full builds use BuildScoreIndex.
-func (se *SearchEngine) addScoreIndex(tokens []string, docID string) {
-	for _, token := range tokens {
-		se.mu.RLock()
-		score := se.Data[token][docID]
-		docs, ok := se.ScoreIndex[token]
-		se.mu.RUnlock()
+func (se *SearchEngine) multiTermSearchIteration(iteration int, queryTokens []string, page int, filters map[string][]interface{}) []ReturnedDocument {
+	lastQueryIndex := len(queryTokens) - 1
+	rawFirstTerms := queryTokens[:lastQueryIndex]
+	rawLastTerm := queryTokens[lastQueryIndex]
+
+	termArrList := make([][]string, len(queryTokens))
+
+	for k, firstTerm := range rawFirstTerms {
+		_, ok := se.Keys.GetData()[firstTerm]
 		if ok {
-			// Binary search for descending insert position.
-			index := sort.Search(len(docs), func(i int) bool {
-				return docs[i].ScoreWeight <= score
-			})
-
-			se.mu.Lock()
-			se.ScoreIndex[token] = append(docs, Document{})
-			copy(se.ScoreIndex[token][index+1:], docs[index:])
-			se.ScoreIndex[token][index] = Document{
-				ID:          docID,
-				ScoreWeight: score,
-				Data:        se.Documents[docID],
-			}
-			se.mu.Unlock()
-		} else {
-			se.mu.Lock()
-			se.ScoreIndex[token] = []Document{{
-				ID:          docID,
-				ScoreWeight: score,
-				Data:        se.Documents[docID],
-			}}
-			se.mu.Unlock()
+			termArrList[k] = []string{firstTerm}
 		}
+		termArrList[k] = append(termArrList[k], se.Symspell.FuzzySearch(firstTerm, 5*iteration*iteration)...)
 	}
+
+	se.mu.RLock()
+	prefixLen := len(se.Prefix[rawLastTerm])
+	maxPrefix := 25 * iteration * iteration
+	if maxPrefix > prefixLen {
+		maxPrefix = prefixLen
+	}
+	lastTermGuessArr := append([]string(nil), se.Prefix[rawLastTerm][0:maxPrefix]...)
+	se.mu.RUnlock()
+
+	termArrList[lastQueryIndex] = lastTermGuessArr
+	if iteration > 1 || len(lastTermGuessArr) == 0 {
+		termArrList[lastQueryIndex] = append(termArrList[lastQueryIndex], se.Symspell.FuzzySearch(rawLastTerm, 5*iteration*iteration)...)
+	}
+
+	if len(filters) > 0 {
+		return se.SearchMultiTermsWithFilter(termArrList, page, filters)
+	}
+	return se.SearchMultipleTermsWithoutFilter(termArrList, page)
 }
 
-// addDocument adds a single document and updates both the inverted index and
-// the ScoreIndex incrementally. Intended for online ingestion.
-func (se *SearchEngine) addDocument(doc map[string]interface{}) {
+// AddOrUpdateDocument inserts or updates a single document.
+// Semantics:
+// - If extID is new: assign a new internal ID and index it.
+// - If extID exists: mark old internal ID deleted, assign a new one, store+index new version.
+//
+// This is consistent with your batch InsertDocs/BuildDocumentIndex behavior.
+func (se *SearchEngine) AddOrUpdateDocument(doc map[string]interface{}) error {
+	if doc == nil {
+		return fmt.Errorf("doc is nil")
+	}
+
 	rawID, ok := doc["id"]
 	if !ok || rawID == nil {
-		return
+		return fmt.Errorf("doc missing id field")
 	}
-	docID := fmt.Sprintf("%v", rawID)
-	if docID == "" || docID == "<nil>" {
-		return
+	extID := fmt.Sprintf("%v", rawID)
+	if extID == "" || extID == "<nil>" {
+		return fmt.Errorf("invalid id value")
 	}
 
-	se.BuildDocumentIndex([]map[string]interface{}{doc})
+	// 1) Resolve fields used for indexing/filtering (read-lock)
+	se.mu.RLock()
+	indexFields := append([]string(nil), se.IndexFields...)
+	filters := se.Filters
+	se.mu.RUnlock()
 
-	se.mu.Lock()
-	se.Documents[docID] = make(map[string]interface{})
-	for k, v := range doc {
-		se.Documents[docID][k] = v
-	}
-	se.mu.Unlock()
-
-	for _, weightField := range se.IndexFields {
+	// 2) Tokenize without holding locks
+	var allTokens []string
+	for _, weightField := range indexFields {
 		if value, exists := doc[weightField]; exists {
 			switch v := value.(type) {
 			case string:
-				tokens := Tokenize(v)
-				se.addScoreIndex(tokens, docID)
+				allTokens = append(allTokens, Tokenize(v)...)
 			case []string:
 				for _, item := range v {
-					tokens := Tokenize(item)
-					se.addScoreIndex(tokens, docID)
+					allTokens = append(allTokens, Tokenize(item)...)
 				}
 			case []interface{}:
 				for _, item := range v {
 					if str, ok := item.(string); ok {
-						tokens := Tokenize(str)
-						se.addScoreIndex(tokens, docID)
+						allTokens = append(allTokens, Tokenize(str)...)
 					}
 				}
 			}
 		}
 	}
-}
 
-func (se *SearchEngine) removeFromPrefix(term string) {
-	for i := 1; i <= len(term); i++ {
-		prefix := term[:i]
+	// 3) Create new internal doc + tombstone old (write-lock)
+	var internal uint32
+	se.mu.Lock()
 
-		list, ok := se.Prefix[prefix]
-		if !ok {
+	// tombstone previous internal doc if exists
+	if oldInternal, exists := se.ExternalToInternal[extID]; exists {
+		se.DocDeleted[oldInternal] = true
+	}
+
+	// assign new internal id
+	internal = se.nextInternalID
+	se.nextInternalID++
+
+	se.ExternalToInternal[extID] = internal
+	se.InternalToExternal[internal] = extID
+
+	// store doc copy
+	se.Documents[internal] = make(map[string]interface{}, len(doc))
+	for k, v := range doc {
+		se.Documents[internal][k] = v
+	}
+
+	se.mu.Unlock()
+
+	// 4) Index tokens (this function locks internally per token)
+	//    Score normalization uses total token count like your batch version.
+	for _, token := range allTokens {
+		se.addToDocumentIndex(token, internal, len(allTokens))
+	}
+
+	// 5) Update filters (write-lock per key, consistent with batch version)
+	//    NOTE: We do not remove old internal IDs from filter sets (tombstone model).
+	for field := range filters {
+		value, exists := doc[field]
+		if !exists {
 			continue
 		}
 
-		// Find and remove "term" from the slice
-		for j := 0; j < len(list); j++ {
-			if list[j] == term {
-				// swap-remove (order does NOT matter)
-				list[j] = list[len(list)-1]
-				list = list[:len(list)-1]
-				break
+		switch v := value.(type) {
+		case int, int8, int16, int32, int64, float32, float64:
+			filterKey := fmt.Sprintf("%s:%v", field, v)
+			se.mu.Lock()
+			if se.FilterDocs[filterKey] == nil {
+				se.FilterDocs[filterKey] = make(map[uint32]bool)
 			}
-		}
+			se.FilterDocs[filterKey][internal] = true
+			se.mu.Unlock()
 
-		if len(list) == 0 {
-			delete(se.Prefix, prefix)
-		} else {
-			se.Prefix[prefix] = list
+		case string:
+			filterKey := fmt.Sprintf("%s:%s", field, v)
+			se.mu.Lock()
+			if se.FilterDocs[filterKey] == nil {
+				se.FilterDocs[filterKey] = make(map[uint32]bool)
+			}
+			se.FilterDocs[filterKey][internal] = true
+			se.mu.Unlock()
 		}
 	}
+
+	return nil
 }
 
-// removeDocumentByID deletes a document and cleans up all indexes.
-//
-// It removes the doc from term postings, ScoreIndex, DocData, filter sets,
-// and the Documents store. If a term becomes empty, it is also purged from
-// Keys/Trie/SymSpell.
-func (se *SearchEngine) removeDocumentByID(docID string) {
+// DeleteDocument tombstones the currently-active internal doc for the given external doc ID.
+// It does NOT remove postings or filter entries; search excludes deleted docs via DocDeleted.
+func (se *SearchEngine) DeleteDocument(externalID string) bool {
+	if externalID == "" || externalID == "<nil>" {
+		return false
+	}
+
 	se.mu.Lock()
 	defer se.mu.Unlock()
 
-	for term, docMap := range se.Data {
-		if _, exists := docMap[docID]; exists {
-			delete(docMap, docID)
-			if len(docMap) == 0 {
-				se.Keys.Remove(term)
-				// se.Trie.Remove(term)
-				se.removeFromPrefix(term)
-				se.Symspell.DeleteWord(term)
-				delete(se.Data, term)
-			}
-		}
+	internal, ok := se.ExternalToInternal[externalID]
+	if !ok {
+		return false
 	}
 
-	for term, docs := range se.ScoreIndex {
-		for i, doc := range docs {
-			if doc.ID == docID {
-				se.ScoreIndex[term] = append(se.ScoreIndex[term][:i], se.ScoreIndex[term][i+1:]...)
-			}
-		}
-	}
+	se.DocDeleted[internal] = true
 
-	for filter, docMap := range se.FilterDocs {
-		if _, exists := docMap[docID]; exists {
-			delete(docMap, docID)
-			if len(docMap) == 0 {
-				delete(se.FilterDocs, filter)
-			}
-		}
-	}
-
-	delete(se.Documents, docID)
+	return true
 }
 
-// Tokenize splits text into tokens by:
-//  1. lowercasing,
-//  2. stripping non-alphanumeric characters,
-//  3. dropping stopwords.
-//
-// Example:
-//
-//	"The Iron-Maiden, 2024!" -> ["ironmaiden", "2024"]
+// Tokenize splits text into tokens by lowercasing, stripping non-alphanumeric, dropping stopwords.
 func Tokenize(content string) []string {
 	nonAlphaNumeric := regexp.MustCompile(`[^a-zA-Z0-9]+`)
 

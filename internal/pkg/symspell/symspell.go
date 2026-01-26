@@ -68,6 +68,7 @@ func (s *SymSpell) DeleteWord(word string) {
 	}
 }
 
+// FuzzySearch returns all dictionary words within Levenshtein distance ≤1 of query.
 func (s *SymSpell) FuzzySearch(query string, maxReturnCount int) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -105,44 +106,5 @@ func (s *SymSpell) FuzzySearch(query string, maxReturnCount int) []string {
 		}
 	}
 
-	return results
-}
-
-// FuzzySearch returns all dictionary words within Levenshtein distance ≤1 of query.
-func (s *SymSpell) FuzzySearchOld(query string, maxReturnCount int) []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	candidates := make(map[string]struct{})
-
-	if originals, existsInDeleteMap := s.DeleteMap[query]; existsInDeleteMap {
-		for w := range originals {
-			candidates[w] = struct{}{}
-		}
-	}
-
-	for i := 0; i < len(query); i++ {
-		if len(candidates) >= maxReturnCount {
-			break
-		}
-		del := query[:i] + query[i+1:]
-		if originals, existsInDeleteMap := s.DeleteMap[del]; existsInDeleteMap {
-			for w := range originals {
-				candidates[w] = struct{}{}
-			}
-		}
-	}
-
-	delete(candidates, query)
-
-	var results []string
-
-	counter := 0
-	for w := range candidates {
-		counter++
-		results = append(results, w)
-		if counter >= maxReturnCount {
-			break
-		}
-	}
 	return results
 }

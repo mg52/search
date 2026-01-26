@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,26 +39,52 @@ type CreateIndexRequest struct {
 	IndexFields []string `json:"indexFields"`
 	Filters     []string `json:"filters"`
 	PageCount   int      `json:"pageCount"`
-	Shards      int      `json:"shards"`
 }
 
 // CreateIndexResponse is returned on succressful index creation.
 type CreateIndexResponse struct {
 	IndexName string `json:"indexName"`
 	PageCount int    `json:"pageCount"`
-	Shards    int    `json:"shards"`
 	Duration  string `json:"duration"`
 }
 
+// AddOrUpdateDocumentRequest is the payload for inserting/updating a single document.
+type AddOrUpdateDocumentRequest struct {
+	IndexName string                 `json:"indexName,omitempty"` // optional, can also come from query param
+	Document  map[string]interface{} `json:"document"`
+}
+
+// AddOrUpdateDocumentResponse is returned on successful upsert.
+type AddOrUpdateDocumentResponse struct {
+	Status     string `json:"status"`
+	StatusCode int    `json:"statusCode"`
+	IndexName  string `json:"indexName"`
+	ID         string `json:"id"`
+	Duration   string `json:"duration"`
+	DurationMs int64  `json:"durationMs"`
+	TotalDocs  int64  `json:"totalDocs"`
+}
+
+// DeleteDocumentResponse is returned on successful delete.
+type DeleteDocumentResponse struct {
+	Status     string `json:"status"`
+	StatusCode int    `json:"statusCode"`
+	IndexName  string `json:"indexName"`
+	ID         string `json:"id"`
+	Deleted    bool   `json:"deleted"`
+	Duration   string `json:"duration"`
+	DurationMs int64  `json:"durationMs"`
+}
+
 type HTTP struct {
-	mu          sync.RWMutex
-	controllers map[string]*engine.SearchEngineController
+	mu      sync.RWMutex
+	engines map[string]*engine.SearchEngine
 }
 
 // NewHTTP initializes the handler with an empty map.
 func NewHTTP() *HTTP {
 	return &HTTP{
-		controllers: make(map[string]*engine.SearchEngineController),
+		engines: make(map[string]*engine.SearchEngine),
 	}
 }
 
@@ -87,7 +115,7 @@ func (ht *HTTP) Search(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ht.mu.RLock()
-	sec, ok := ht.controllers[indexName]
+	sec, ok := ht.engines[indexName]
 	ht.mu.RUnlock()
 	if !ok {
 		ErrWriter(w, fmt.Errorf("index %q not found", indexName))
@@ -115,12 +143,9 @@ func (ht *HTTP) Search(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-
 	startTime := time.Now()
 
-	result := sec.Search(ctx, query, pageInt, filters, 0)
+	result := sec.Search(query, pageInt, filters)
 
 	duration := time.Since(startTime)
 
@@ -166,7 +191,7 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ht.mu.RLock()
-	_, exists := ht.controllers[req.IndexName]
+	_, exists := ht.engines[req.IndexName]
 	ht.mu.RUnlock()
 	if exists {
 		ErrWriter(w, fmt.Errorf("index %q already exists", req.IndexName))
@@ -174,12 +199,7 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.PageCount <= 0 {
-		// Default page count for each shard is 10.
 		req.PageCount = 10
-	}
-	if req.Shards <= 0 {
-		// Default worker count is 4.
-		req.Shards = 4
 	}
 
 	filterMap := make(map[string]bool, len(req.Filters))
@@ -188,16 +208,15 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := time.Now()
-	sec := engine.NewSearchEngineController(
+	sec := engine.NewSearchEngine(
 		req.IndexFields,
 		filterMap,
 		req.PageCount,
-		req.Shards,
 	)
 	elapsed := time.Since(start)
 
 	ht.mu.Lock()
-	ht.controllers[req.IndexName] = sec
+	ht.engines[req.IndexName] = sec
 	ht.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -205,7 +224,6 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(CreateIndexResponse{
 		IndexName: req.IndexName,
 		PageCount: req.PageCount,
-		Shards:    req.Shards,
 		Duration:  elapsed.String(),
 	})
 }
@@ -225,7 +243,7 @@ func (ht *HTTP) AddToIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ht.mu.RLock()
-	sec, ok := ht.controllers[indexName]
+	sec, ok := ht.engines[indexName]
 	ht.mu.RUnlock()
 	if !ok {
 		ErrWriter(w, fmt.Errorf("index %q not found", indexName))
@@ -284,181 +302,28 @@ func (ht *HTTP) AddToIndex(w http.ResponseWriter, r *http.Request) {
 		AddedCount: len(docs),
 		Duration:   elapsed.String(),
 		DurationMs: elapsed.Milliseconds(),
-		TotalDocs:  sec.NumberOfTotalDocs,
+		TotalDocs:  int64(len(sec.Documents)),
 	})
 }
 
-// AddOrUpdateDocument handles POST /add-or-update-document?index=<indexName>
-// with the document JSON in the body.
-func (ht *HTTP) AddOrUpdateDocument(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		ErrWriter(w, fmt.Errorf("unsupported method"))
-		return
-	}
-
-	indexName := r.URL.Query().Get("index")
-	if indexName == "" {
-		ErrWriter(w, fmt.Errorf("`index` query parameter is required"))
-		return
-	}
-
-	ht.mu.RLock()
-	sec, ok := ht.controllers[indexName]
-	ht.mu.RUnlock()
-	if !ok {
-		ErrWriter(w, fmt.Errorf("index %q not found", indexName))
-		return
-	}
-
-	var doc map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&doc); err != nil {
-		ErrWriter(w, fmt.Errorf("invalid JSON body: %w", err))
-		return
-	}
-
-	sec.AddOrUpdateDocument(doc)
-
-	resp := map[string]interface{}{
-		"status":     "success",
-		"statusCode": 200,
-		"index":      indexName,
-		"document":   doc,
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		ErrWriter(w, err)
-	}
-}
-
-// AddOrUpdateDocumentInBulk handles POST /add-or-update-document-bulk?index=<indexName>
-// with the request body being a JSON array of documents.
-func (ht *HTTP) AddOrUpdateDocumentInBulk(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		ErrWriter(w, fmt.Errorf("unsupported method"))
-		return
-	}
-
-	indexName := r.URL.Query().Get("index")
-	if indexName == "" {
-		ErrWriter(w, fmt.Errorf("`index` query parameter is required"))
-		return
-	}
-
-	ht.mu.RLock()
-	sec, ok := ht.controllers[indexName]
-	ht.mu.RUnlock()
-	if !ok {
-		ErrWriter(w, fmt.Errorf("index %q not found", indexName))
-		return
-	}
-
-	var docs []map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&docs); err != nil {
-		ErrWriter(w, fmt.Errorf("invalid JSON body: %w", err))
-		return
-	}
-
-	start := time.Now()
-
-	workerCount := sec.SearchEngineCount
-	jobs := make(chan map[string]interface{}, len(docs))
-	var wg sync.WaitGroup
-
-	wg.Add(workerCount)
-	for i := 0; i < workerCount; i++ {
-		go func() {
-			defer wg.Done()
-			for doc := range jobs {
-				sec.AddOrUpdateDocument(doc)
-			}
-		}()
-	}
-
-	for _, doc := range docs {
-		jobs <- doc
-	}
-	close(jobs)
-
-	wg.Wait()
-	dur := time.Since(start)
-
-	resp := map[string]interface{}{
-		"status":        "success",
-		"statusCode":    200,
-		"index":         indexName,
-		"documentCount": len(docs),
-		"duration":      dur.String(),
-		"durationMs":    dur.Milliseconds(),
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		ErrWriter(w, err)
-	}
-}
-
-// RemoveDocumentByID handles DELETE /remove-document-by-id?index=<indexName>&id=<documentID>
-func (ht *HTTP) RemoveDocumentByID(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
-		w.Header().Set("Allow", http.MethodDelete)
-		ErrWriter(w, fmt.Errorf("unsupported method"))
-		return
-	}
-
-	indexName := r.URL.Query().Get("index")
-	if indexName == "" {
-		ErrWriter(w, fmt.Errorf("`index` query parameter is required"))
-		return
-	}
-
-	docID := r.URL.Query().Get("id")
-	if docID == "" {
-		ErrWriter(w, fmt.Errorf("`id` query parameter is required"))
-		return
-	}
-
-	ht.mu.RLock()
-	sec, ok := ht.controllers[indexName]
-	ht.mu.RUnlock()
-	if !ok {
-		ErrWriter(w, fmt.Errorf("index %q not found", indexName))
-		return
-	}
-
-	sec.RemoveDocumentByID(docID)
-
-	resp := map[string]interface{}{
-		"status":     "success",
-		"statusCode": 200,
-		"index":      indexName,
-		"removedID":  docID,
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(resp)
-}
-
-// SaveControllerRequest is the payload for saving a controller to disk.
-type SaveControllerRequest struct {
+// SaveEngineRequest is the payload for saving an engine to disk.
+type SaveEngineRequest struct {
 	IndexName string `json:"indexName"`
 }
 
-// LoadControllerRequest is the payload for loading a controller from disk.
-type LoadControllerRequest struct {
+// LoadEngineRequest is the payload for loading an engine from disk.
+type LoadEngineRequest struct {
 	IndexName string `json:"indexName"`
 }
 
-// SaveController persists all shard files for the named controller.
-func (ht *HTTP) SaveController(w http.ResponseWriter, r *http.Request) {
+// SaveEngine persists all files for the named engine.
+func (ht *HTTP) SaveEngine(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		ErrWriter(w, fmt.Errorf("unsupported method"))
 		return
 	}
-	var req SaveControllerRequest
+	var req SaveEngineRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		ErrWriter(w, fmt.Errorf("invalid JSON payload: %w", err))
 		return
@@ -468,14 +333,14 @@ func (ht *HTTP) SaveController(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ht.mu.RLock()
-	sec, ok := ht.controllers[req.IndexName]
+	sec, ok := ht.engines[req.IndexName]
 	ht.mu.RUnlock()
 	if !ok {
 		ErrWriter(w, fmt.Errorf("index %q not found", req.IndexName))
 		return
 	}
-	if err := sec.SaveAllShards(req.IndexName); err != nil {
-		ErrWriter(w, fmt.Errorf("failed to save controller: %w", err))
+	if err := sec.SaveAll(req.IndexName); err != nil {
+		ErrWriter(w, fmt.Errorf("failed to save engine: %w", err))
 		return
 	}
 	resp := map[string]interface{}{
@@ -488,14 +353,14 @@ func (ht *HTTP) SaveController(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-func (ht *HTTP) LoadController(w http.ResponseWriter, r *http.Request) {
+func (ht *HTTP) LoadEngine(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		ErrWriter(w, fmt.Errorf("unsupported method"))
 		return
 	}
 
-	var req LoadControllerRequest
+	var req LoadEngineRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		ErrWriter(w, fmt.Errorf("invalid JSON payload: %w", err))
 		return
@@ -505,33 +370,159 @@ func (ht *HTTP) LoadController(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ht.mu.Lock()
-	sec, exists := ht.controllers[req.IndexName]
-	if !exists {
-		ht.controllers[req.IndexName] = &engine.SearchEngineController{}
-		sec = ht.controllers[req.IndexName]
+	baseDir := os.Getenv("INDEX_DATA_DIR")
+	if baseDir == "" {
+		baseDir = "./data"
 	}
-	ht.mu.Unlock()
 
+	dataDir := filepath.Join(baseDir, req.IndexName)
 	start := time.Now()
-	if err := sec.LoadAllShards(req.IndexName); err != nil {
+	eng, err := engine.LoadAll(dataDir)
+	if err != nil {
 		ErrWriter(w, err)
 		return
 	}
 
+	ht.engines[req.IndexName] = eng
 	duration := time.Since(start)
 
 	resp := map[string]interface{}{
 		"status":     "success",
 		"statusCode": 200,
 		"indexName":  req.IndexName,
-		"shards":     sec.SearchEngineCount,
 		"duration":   duration.String(),
 		"durationMs": duration.Milliseconds(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(resp)
+}
+
+// AddOrUpdateDocument upserts a single document into an existing index.
+// Endpoint suggestion: POST /document?indexName=...
+// Body: either { "document": {...} } or { "indexName": "...", "document": {...} }
+func (ht *HTTP) AddOrUpdateDocument(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		ErrWriter(w, fmt.Errorf("method not allowed"))
+		return
+	}
+
+	// indexName can be in query or body
+	indexName := r.URL.Query().Get("indexName")
+
+	var req AddOrUpdateDocumentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		ErrWriter(w, fmt.Errorf("invalid JSON payload: %w", err))
+		return
+	}
+	if indexName == "" {
+		indexName = req.IndexName
+	}
+	if indexName == "" {
+		ErrWriter(w, errors.New("`indexName` is required (query param or JSON body)"))
+		return
+	}
+	if req.Document == nil {
+		ErrWriter(w, errors.New("`document` is required"))
+		return
+	}
+
+	// Find engine
+	ht.mu.RLock()
+	sec, ok := ht.engines[indexName]
+	ht.mu.RUnlock()
+	if !ok {
+		ErrWriter(w, fmt.Errorf("index %q not found", indexName))
+		return
+	}
+
+	// Validate id early for response fields
+	rawID, ok := req.Document["id"]
+	if !ok || rawID == nil {
+		ErrWriter(w, errors.New("document missing `id` field"))
+		return
+	}
+	docID := fmt.Sprintf("%v", rawID)
+	if docID == "" || docID == "<nil>" {
+		ErrWriter(w, errors.New("invalid document `id`"))
+		return
+	}
+
+	start := time.Now()
+	if err := sec.AddOrUpdateDocument(req.Document); err != nil {
+		ErrWriter(w, err)
+		return
+	}
+	duration := time.Since(start)
+
+	resp := AddOrUpdateDocumentResponse{
+		Status:     "success",
+		StatusCode: 200,
+		IndexName:  indexName,
+		ID:         docID,
+		Duration:   duration.String(),
+		DurationMs: duration.Milliseconds(),
+		TotalDocs:  int64(len(sec.Documents)),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// DeleteDocument deletes (tombstones) a single document by external ID.
+// Endpoint suggestion: DELETE /document?indexName=...&id=...
+func (ht *HTTP) DeleteDocument(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		w.Header().Set("Allow", http.MethodDelete)
+		ErrWriter(w, fmt.Errorf("method not allowed"))
+		return
+	}
+
+	indexName := r.URL.Query().Get("indexName")
+	if indexName == "" {
+		ErrWriter(w, errors.New("`indexName` query parameter is required"))
+		return
+	}
+
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		ErrWriter(w, errors.New("`id` query parameter is required"))
+		return
+	}
+
+	ht.mu.RLock()
+	sec, ok := ht.engines[indexName]
+	ht.mu.RUnlock()
+	if !ok {
+		ErrWriter(w, fmt.Errorf("index %q not found", indexName))
+		return
+	}
+
+	start := time.Now()
+	deleted := sec.DeleteDocument(id)
+	duration := time.Since(start)
+
+	// If you want "not found" to be 404, do this:
+	// if !deleted {
+	// 	http.Error(w, "document not found", http.StatusNotFound)
+	// 	return
+	// }
+
+	resp := DeleteDocumentResponse{
+		Status:     "success",
+		StatusCode: 200,
+		IndexName:  indexName,
+		ID:         id,
+		Deleted:    deleted,
+		Duration:   duration.String(),
+		DurationMs: duration.Milliseconds(),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // Health is a simple health‐check endpoint that returns how long it took
