@@ -74,3 +74,11 @@ func LoadKeys(path string) (*Keys, error) {
 	k.mu.Unlock()
 	return k, nil
 }
+
+func (k *Keys) Exists(key string) bool {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+
+	_, ok := k.Data[key]
+	return ok
+}

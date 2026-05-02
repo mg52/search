@@ -1,0 +1,132 @@
+package engine
+
+import (
+	"fmt"
+	"math/rand"
+	"testing"
+)
+
+// small vocabulary to create overlap between docs (important for search realism)
+var vocab = []string{
+	"apple", "banana", "phone", "laptop", "music",
+	"video", "cloud", "data", "server", "network",
+	"mobile", "device", "smart", "fast", "secure",
+}
+
+// generate a random sentence of N tokens
+func randomText(r *rand.Rand, n int) string {
+	out := ""
+	for i := 0; i < n; i++ {
+		out += vocab[r.Intn(len(vocab))] + " "
+	}
+	return out
+}
+
+// generate 100k docs
+func generateDocs(n int) []map[string]interface{} {
+	r := rand.New(rand.NewSource(42)) // deterministic
+
+	docs := make([]map[string]interface{}, n)
+
+	for i := 0; i < n; i++ {
+		docs[i] = map[string]interface{}{
+			"id":    fmt.Sprintf("%d", i),
+			"title": randomText(r, 5+r.Intn(10)), // 5–15 tokens
+			"tags":  randomText(r, 2+r.Intn(5)),  // 2–6 tokens
+			"genre": []string{"tech", "food", "music"}[r.Intn(3)],
+		}
+	}
+
+	return docs
+}
+
+func BenchmarkIndex100k(b *testing.B) {
+	docs := generateDocs(100_000)
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		se := NewSearchEngine(
+			[]string{"title", "tags"},
+			map[string]bool{"genre": true},
+			10,
+		)
+
+		se.Index(docs)
+	}
+}
+
+func BenchmarkSearch100k_SingleTerm(b *testing.B) {
+	docs := generateDocs(100_000)
+
+	se := NewSearchEngine(
+		[]string{"title", "tags"},
+		map[string]bool{"genre": true},
+		10,
+	)
+	se.Index(docs)
+
+	queries := []string{"apple", "phone", "cloud", "data"}
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		q := queries[i%len(queries)]
+		res := se.Search(q, nil)
+		if res == nil {
+			b.Fatalf("unexpected nil result")
+		}
+	}
+}
+
+func BenchmarkSearch100k_MultiTerm(b *testing.B) {
+	docs := generateDocs(100_000)
+
+	se := NewSearchEngine(
+		[]string{"title", "tags"},
+		map[string]bool{"genre": true},
+		10,
+	)
+	se.Index(docs)
+
+	queries := []string{
+		"apple phone",
+		"cloud data",
+		"music video",
+		"secure network",
+	}
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		q := queries[i%len(queries)]
+		res := se.Search(q, nil)
+		if res == nil {
+			b.Fatalf("unexpected nil result")
+		}
+	}
+}
+
+func BenchmarkSearch100k_WithFilter(b *testing.B) {
+	docs := generateDocs(100_000)
+
+	se := NewSearchEngine(
+		[]string{"title", "tags"},
+		map[string]bool{"genre": true},
+		10,
+	)
+	se.Index(docs)
+
+	filters := map[string][]interface{}{
+		"genre": {"tech"},
+	}
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		res := se.Search("apple phone", filters)
+		if res == nil {
+			b.Fatalf("unexpected nil result")
+		}
+	}
+}

@@ -19,7 +19,7 @@ import (
 func TestCreateIndexHandler(t *testing.T) {
 	h := NewHTTP()
 	// Valid create-index request
-	body := `{"indexName":"testidx","indexFields":["name"],"filters":["year"],"pageCount":5,"workers":2}`
+	body := `{"indexName":"testidx","indexFields":["name"],"filters":["year"],"resultCount":5,"workers":2}`
 	req := httptest.NewRequest(http.MethodPost, "/create-index", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
@@ -58,7 +58,7 @@ func TestHealthHandler(t *testing.T) {
 
 func TestSearchHandler_NoIndex(t *testing.T) {
 	h := NewHTTP()
-	req := httptest.NewRequest(http.MethodGet, "/search?index=unknown&q=a&page=0", nil)
+	req := httptest.NewRequest(http.MethodGet, "/search?index=unknown&q=a", nil)
 	rr := httptest.NewRecorder()
 	h.Search(rr, req)
 
@@ -146,7 +146,7 @@ func TestSaveEngine_Success(t *testing.T) {
 func TestSearchHandler_Errors(t *testing.T) {
 	h := NewHTTP()
 	// Method not allowed
-	req := httptest.NewRequest(http.MethodPost, "/search?index=idx&q=x&page=0", nil)
+	req := httptest.NewRequest(http.MethodPost, "/search?index=idx&q=x", nil)
 	rr := httptest.NewRecorder()
 	h.Search(rr, req)
 	if rr.Code != http.StatusInternalServerError {
@@ -154,20 +154,11 @@ func TestSearchHandler_Errors(t *testing.T) {
 	}
 
 	// Missing index
-	req = httptest.NewRequest(http.MethodGet, "/search?q=x&page=0", nil)
+	req = httptest.NewRequest(http.MethodGet, "/search?q=x", nil)
 	rr = httptest.NewRecorder()
 	h.Search(rr, req)
 	if rr.Code != http.StatusInternalServerError {
 		t.Errorf("GET /search missing index expected 500, got %d", rr.Code)
-	}
-
-	// Invalid page
-	req = httptest.NewRequest(http.MethodGet, "/search?index=idx&q=x&page=abc", nil)
-	rr = httptest.NewRecorder()
-	h.engines["idx"] = engine.NewSearchEngine([]string{"f"}, nil, 1)
-	h.Search(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("GET /search invalid page expected 500, got %d", rr.Code)
 	}
 }
 
@@ -190,7 +181,7 @@ func TestCreateIndexHandler_Errors(t *testing.T) {
 	}
 
 	// Missing indexName
-	body := `{"indexFields":["f"],"filters":[],"pageCount":1,"workers":1}`
+	body := `{"indexFields":["f"],"filters":[],"resultCount":1,"workers":1}`
 	req = httptest.NewRequest(http.MethodPost, "/create-index", strings.NewReader(body))
 	rr = httptest.NewRecorder()
 	h.CreateIndex(rr, req)
@@ -200,7 +191,7 @@ func TestCreateIndexHandler_Errors(t *testing.T) {
 
 	// Already exists
 	// first create valid
-	valid := `{"indexName":"dup","indexFields":["f"],"filters":[],"pageCount":1,"workers":1}`
+	valid := `{"indexName":"dup","indexFields":["f"],"filters":[],"resultCount":1,"workers":1}`
 	req = httptest.NewRequest(http.MethodPost, "/create-index", strings.NewReader(valid))
 	rr = httptest.NewRecorder()
 	h.CreateIndex(rr, req)
@@ -353,7 +344,7 @@ func TestDocumentEndpoints_E2E_AddUpdateDeleteSearch(t *testing.T) {
 	h := NewHTTP()
 
 	// 1) Create index with indexFields=["name"] and filter=["year"]
-	createBody := `{"indexName":"testidx","indexFields":["name"],"filters":["year"],"pageCount":10}`
+	createBody := `{"indexName":"testidx","indexFields":["name"],"filters":["year"],"resultCount":10}`
 	req := httptest.NewRequest(http.MethodPost, "/create-index", strings.NewReader(createBody))
 	req.Header.Set("Content-Type", "application/json")
 	rr := httptest.NewRecorder()
@@ -382,7 +373,7 @@ func TestDocumentEndpoints_E2E_AddUpdateDeleteSearch(t *testing.T) {
 
 	// helper: GET /search
 	search := func(q string) map[string]interface{} {
-		r := httptest.NewRequest(http.MethodGet, "/search?index=testidx&q="+q+"&page=0", nil)
+		r := httptest.NewRequest(http.MethodGet, "/search?index=testidx&q="+q, nil)
 		rec := httptest.NewRecorder()
 		h.Search(rec, r)
 		if rec.Code != http.StatusOK {

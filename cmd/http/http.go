@@ -2,7 +2,6 @@ package http
 
 import (
 	"bytes"
-	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -11,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,14 +36,14 @@ type CreateIndexRequest struct {
 	IndexName   string   `json:"indexName"`
 	IndexFields []string `json:"indexFields"`
 	Filters     []string `json:"filters"`
-	PageCount   int      `json:"pageCount"`
+	ResultCount int      `json:"resultCount"`
 }
 
 // CreateIndexResponse is returned on succressful index creation.
 type CreateIndexResponse struct {
-	IndexName string `json:"indexName"`
-	PageCount int    `json:"pageCount"`
-	Duration  string `json:"duration"`
+	IndexName   string `json:"indexName"`
+	ResultCount int    `json:"resultCount"`
+	Duration    string `json:"duration"`
 }
 
 // AddOrUpdateDocumentRequest is the payload for inserting/updating a single document.
@@ -123,12 +121,6 @@ func (ht *HTTP) Search(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := r.URL.Query().Get("q")
-	pageStr := r.URL.Query().Get("page")
-	pageInt, err := strconv.Atoi(pageStr)
-	if err != nil {
-		ErrWriter(w, fmt.Errorf("invalid page number: %w", err))
-		return
-	}
 
 	// Parse filters
 	filters := make(map[string][]interface{})
@@ -145,18 +137,9 @@ func (ht *HTTP) Search(w http.ResponseWriter, r *http.Request) {
 
 	startTime := time.Now()
 
-	result := sec.Search(query, pageInt, filters)
+	result := sec.Search(query, filters)
 
 	duration := time.Since(startTime)
-
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			http.Error(w, "search timeout exceeded", http.StatusGatewayTimeout)
-			return
-		}
-		ErrWriter(w, err)
-		return
-	}
 
 	resp := map[string]interface{}{
 		"status":       "success",
@@ -198,8 +181,8 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.PageCount <= 0 {
-		req.PageCount = 10
+	if req.ResultCount <= 0 {
+		req.ResultCount = 100
 	}
 
 	filterMap := make(map[string]bool, len(req.Filters))
@@ -211,7 +194,7 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 	sec := engine.NewSearchEngine(
 		req.IndexFields,
 		filterMap,
-		req.PageCount,
+		req.ResultCount,
 	)
 	elapsed := time.Since(start)
 
@@ -222,9 +205,9 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(CreateIndexResponse{
-		IndexName: req.IndexName,
-		PageCount: req.PageCount,
-		Duration:  elapsed.String(),
+		IndexName:   req.IndexName,
+		ResultCount: req.ResultCount,
+		Duration:    elapsed.String(),
 	})
 }
 

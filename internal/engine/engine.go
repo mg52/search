@@ -61,7 +61,7 @@ type enginePayload struct {
 	NextInternalID     uint32
 	IndexFields        []string
 	Filters            map[string]bool
-	PageSize           int
+	ResultSize         int
 }
 
 // SearchEngine maintains an inverted index plus auxiliary structures for
@@ -85,13 +85,13 @@ type SearchEngine struct {
 	Symspell    *symspell.SymSpell
 	IndexFields []string
 	Filters     map[string]bool
-	PageSize    int
+	ResultSize  int
 
 	mu sync.RWMutex
 }
 
 // NewSearchEngine constructs a new, empty engine ready to index documents.
-func NewSearchEngine(indexFields []string, filters map[string]bool, pageSize int) *SearchEngine {
+func NewSearchEngine(indexFields []string, filters map[string]bool, resultSize int) *SearchEngine {
 	return &SearchEngine{
 		DataMap:            make(map[string]map[uint32]int),
 		DocDeleted:         make(map[uint32]bool),
@@ -106,7 +106,7 @@ func NewSearchEngine(indexFields []string, filters map[string]bool, pageSize int
 		Prefix:             make(map[string][]string),
 		Symspell:           symspell.NewSymSpell(),
 		FilterDocs:         make(map[string]map[uint32]bool),
-		PageSize:           pageSize,
+		ResultSize:         resultSize,
 	}
 }
 
@@ -136,7 +136,7 @@ func (se *SearchEngine) SaveAll(path string) error {
 		NextInternalID:     se.nextInternalID,
 		IndexFields:        se.IndexFields,
 		Filters:            se.Filters,
-		PageSize:           se.PageSize,
+		ResultSize:         se.ResultSize,
 	}
 
 	engineFile := path + "/engine.gob"
@@ -184,7 +184,7 @@ func LoadAll(path string) (*SearchEngine, error) {
 		Symspell:           symspell.NewSymSpell(),
 		IndexFields:        nil,
 		Filters:            make(map[string]bool),
-		PageSize:           0,
+		ResultSize:         100,
 	}
 
 	// Restore docs + metadata
@@ -195,7 +195,7 @@ func LoadAll(path string) (*SearchEngine, error) {
 	se.nextInternalID = payload.NextInternalID
 	se.IndexFields = payload.IndexFields
 	se.Filters = payload.Filters
-	se.PageSize = payload.PageSize
+	se.ResultSize = payload.ResultSize
 
 	// Safety: if NextInternalID missing/zero in older payloads
 	if se.nextInternalID == 0 {
@@ -495,9 +495,9 @@ func (se *SearchEngine) addToDocumentIndex(term string, internalDocID uint32, le
 		if se.Prefix == nil {
 			se.Prefix = make(map[string][]string)
 		}
-		if len(se.Prefix[term]) < MaxPrefixTerms {
-			se.Prefix[term] = append(se.Prefix[term], term)
-		}
+		// if len(se.Prefix[term]) < MaxPrefixTerms {
+		// 	se.Prefix[term] = append(se.Prefix[term], term)
+		// }
 		for i := 1; i < len(term); i++ {
 			pfx := term[0:i]
 			if len(se.Prefix[pfx]) >= MaxPrefixTerms {
@@ -515,9 +515,9 @@ func (se *SearchEngine) addToDocumentIndex(term string, internalDocID uint32, le
 
 // -------------------- Search --------------------
 
-// SearchOneTermWithoutFilter retrieves a page of results for a single term.
+// SearchOneTermWithoutFilter retrieves results for a single term.
 // Search holds RLock for the whole function to avoid concurrent map read/write panics.
-func (se *SearchEngine) SearchOneTermWithoutFilter(query string, page int) []ReturnedDocument {
+func (se *SearchEngine) SearchOneTermWithoutFilter(query string) []ReturnedDocument {
 	se.mu.RLock()
 	defer se.mu.RUnlock()
 
@@ -525,9 +525,6 @@ func (se *SearchEngine) SearchOneTermWithoutFilter(query string, page int) []Ret
 	if postingsByDoc == nil {
 		return nil
 	}
-
-	start := page * se.PageSize
-	end := start + se.PageSize
 
 	hits := make([]internalHit, 0)
 
@@ -545,15 +542,13 @@ func (se *SearchEngine) SearchOneTermWithoutFilter(query string, page int) []Ret
 
 	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
 
-	if start >= len(hits) {
-		return nil
-	}
+	end := se.ResultSize
 	if end > len(hits) {
 		end = len(hits)
 	}
 
-	out := make([]ReturnedDocument, 0, end-start)
-	for _, hit := range hits[start:end] {
+	out := make([]ReturnedDocument, 0, end)
+	for _, hit := range hits[0:end] {
 		extID := se.InternalToExternal[hit.id]
 		out = append(out, ReturnedDocument{
 			ID:    extID,
@@ -564,11 +559,11 @@ func (se *SearchEngine) SearchOneTermWithoutFilter(query string, page int) []Ret
 	return out
 }
 
-// SearchOneTermWithFilter retrieves a page of results for a single term, applying filters.
+// SearchOneTermWithFilter retrieves results for a single term, applying filters.
 // If filters is nil/empty, it falls back to SearchOneTermWithoutFilter.
-func (se *SearchEngine) SearchOneTermWithFilter(query string, page int, filters map[string][]interface{}) []ReturnedDocument {
+func (se *SearchEngine) SearchOneTermWithFilter(query string, filters map[string][]interface{}) []ReturnedDocument {
 	if len(filters) == 0 {
-		return se.SearchOneTermWithoutFilter(query, page)
+		return se.SearchOneTermWithoutFilter(query)
 	}
 
 	allowed := se.ApplyFilter(filters)
@@ -583,9 +578,6 @@ func (se *SearchEngine) SearchOneTermWithFilter(query string, page int, filters 
 	if postingsByDoc == nil {
 		return nil
 	}
-
-	start := page * se.PageSize
-	end := start + se.PageSize
 
 	hits := make([]internalHit, 0)
 
@@ -605,15 +597,13 @@ func (se *SearchEngine) SearchOneTermWithFilter(query string, page int, filters 
 
 	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
 
-	if start >= len(hits) {
-		return nil
-	}
+	end := se.ResultSize
 	if end > len(hits) {
 		end = len(hits)
 	}
 
-	out := make([]ReturnedDocument, 0, end-start)
-	for _, hit := range hits[start:end] {
+	out := make([]ReturnedDocument, 0, end)
+	for _, hit := range hits[0:end] {
 		out = append(out, ReturnedDocument{
 			ID:    se.InternalToExternal[hit.id],
 			Data:  se.Documents[hit.id],
@@ -625,7 +615,7 @@ func (se *SearchEngine) SearchOneTermWithFilter(query string, page int, filters 
 
 // SearchMultipleTermsWithoutFilter executes AND across groups and OR within group.
 // Search holds RLock for the whole function to avoid concurrent map read/write panics.
-func (se *SearchEngine) SearchMultipleTermsWithoutFilter(termArrList [][]string, page int) []ReturnedDocument {
+func (se *SearchEngine) SearchMultipleTermsWithoutFilter(termArrList [][]string) []ReturnedDocument {
 	if len(termArrList) == 0 {
 		return nil
 	}
@@ -669,9 +659,6 @@ func (se *SearchEngine) SearchMultipleTermsWithoutFilter(termArrList [][]string,
 		}
 	}
 	anchorGroup := groups[anchorIdx]
-
-	start := page * se.PageSize
-	end := start + se.PageSize
 
 	visited := make(map[uint32]struct{}, anchorSize)
 
@@ -725,15 +712,13 @@ func (se *SearchEngine) SearchMultipleTermsWithoutFilter(termArrList [][]string,
 
 	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
 
-	if start >= len(hits) {
-		return nil
-	}
+	end := se.ResultSize
 	if end > len(hits) {
 		end = len(hits)
 	}
 
-	out := make([]ReturnedDocument, 0, end-start)
-	for _, hit := range hits[start:end] {
+	out := make([]ReturnedDocument, 0, end)
+	for _, hit := range hits[0:end] {
 		out = append(out, ReturnedDocument{
 			ID:    se.InternalToExternal[hit.id],
 			Data:  se.Documents[hit.id],
@@ -745,9 +730,9 @@ func (se *SearchEngine) SearchMultipleTermsWithoutFilter(termArrList [][]string,
 
 // SearchMultiTermsWithFilter executes AND across groups and OR within group, applying filters.
 // If filters is nil/empty, it falls back to SearchMultipleTermsWithoutFilter.
-func (se *SearchEngine) SearchMultiTermsWithFilter(termArrList [][]string, page int, filters map[string][]interface{}) []ReturnedDocument {
+func (se *SearchEngine) SearchMultiTermsWithFilter(termArrList [][]string, filters map[string][]interface{}) []ReturnedDocument {
 	if len(filters) == 0 {
-		return se.SearchMultipleTermsWithoutFilter(termArrList, page)
+		return se.SearchMultipleTermsWithoutFilter(termArrList)
 	}
 
 	allowed := se.ApplyFilter(filters)
@@ -798,9 +783,6 @@ func (se *SearchEngine) SearchMultiTermsWithFilter(termArrList [][]string, page 
 		}
 	}
 	anchorGroup := groups[anchorIdx]
-
-	start := page * se.PageSize
-	end := start + se.PageSize
 
 	visited := make(map[uint32]struct{}, anchorSize)
 	hits := make([]internalHit, 0)
@@ -857,15 +839,13 @@ func (se *SearchEngine) SearchMultiTermsWithFilter(termArrList [][]string, page 
 
 	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
 
-	if start >= len(hits) {
-		return nil
-	}
+	end := se.ResultSize
 	if end > len(hits) {
 		end = len(hits)
 	}
 
-	out := make([]ReturnedDocument, 0, end-start)
-	for _, hit := range hits[start:end] {
+	out := make([]ReturnedDocument, 0, end)
+	for _, hit := range hits[0:end] {
 		out = append(out, ReturnedDocument{
 			ID:    se.InternalToExternal[hit.id],
 			Data:  se.Documents[hit.id],
@@ -922,93 +902,91 @@ func (se *SearchEngine) ApplyFilter(filters map[string][]interface{}) map[uint32
 }
 
 // Search executes a query (single or multi-term), selecting between exact/prefix/fuzzy strategies.
-func (se *SearchEngine) Search(query string, page int, filters map[string][]interface{}) *SearchResult {
+func (se *SearchEngine) Search(query string, filters map[string][]interface{}) *SearchResult {
 	queryTokens := Tokenize(query)
 	if len(queryTokens) == 0 {
 		return nil
 	} else if len(queryTokens) == 1 {
-		return se.SingleTermSearch(queryTokens, page, filters)
+		return se.SingleTermSearch(queryTokens, filters)
 	} else {
-		return se.MultiTermSearch(queryTokens, page, filters)
+		return se.MultiTermSearch(queryTokens, filters)
 	}
 }
 
 // SingleTermSearch resolves a single-token query via prefix (preferred) or fuzzy expansions.
 // Filter behavior preserved: your original SingleTermSearch ignored filters in else-block.
-func (se *SearchEngine) SingleTermSearch(queryTokens []string, page int, filters map[string][]interface{}) *SearchResult {
+func (se *SearchEngine) SingleTermSearch(queryTokens []string, filters map[string][]interface{}) *SearchResult {
 	parsedQuery := make(map[string][]string)
-	maxToken := 3
+	maxPrefixTokens := 3
+	maxFuzzyTokens := 3
 
 	se.mu.RLock()
 	prefixTokens := append([]string(nil), se.Prefix[queryTokens[0]]...)
 	se.mu.RUnlock()
 
-	if len(prefixTokens) < maxToken {
-		maxToken = len(prefixTokens)
+	if len(prefixTokens) < maxPrefixTokens {
+		maxPrefixTokens = len(prefixTokens)
 	}
-	guessArr := prefixTokens[:maxToken]
+	guessArr := prefixTokens[:maxPrefixTokens]
 
 	if len(guessArr) > 0 {
 		parsedQuery["prefix"] = append(parsedQuery["prefix"], guessArr...)
 	} else {
-		fuzzyWords := se.Symspell.FuzzySearch(queryTokens[0], 3)
+		fuzzyWords := se.Symspell.FuzzySearch(queryTokens[0], maxFuzzyTokens)
 		if len(fuzzyWords) > 0 {
 			parsedQuery["fuzzy"] = append(parsedQuery["fuzzy"], fuzzyWords...)
-		} else {
-			parsedQuery["fuzzy"] = append(parsedQuery["fuzzy"], queryTokens[0])
 		}
 	}
 
 	var finalDocs []ReturnedDocument
+	if exists := se.Keys.Exists(queryTokens[0]); exists {
+		if len(filters) > 0 {
+			finalDocs = append(finalDocs, se.SearchOneTermWithFilter(queryTokens[0], filters)...)
+		} else {
+			finalDocs = append(finalDocs, se.SearchOneTermWithoutFilter(queryTokens[0])...)
+		}
+	}
 	if parsedQuery["prefix"] != nil {
 		for _, q := range parsedQuery["prefix"] {
 			if len(filters) > 0 {
-				finalDocs = append(finalDocs, se.SearchOneTermWithFilter(q, page, filters)...)
+				finalDocs = append(finalDocs, se.SearchOneTermWithFilter(q, filters)...)
 			} else {
-				finalDocs = append(finalDocs, se.SearchOneTermWithoutFilter(q, page)...)
+				finalDocs = append(finalDocs, se.SearchOneTermWithoutFilter(q)...)
 			}
 		}
-		return &SearchResult{Docs: finalDocs}
+		limit := se.ResultSize
+		if len(finalDocs) < limit {
+			limit = len(finalDocs)
+		}
+		return &SearchResult{Docs: finalDocs[0:limit]}
 	}
 	if parsedQuery["fuzzy"] != nil {
 		for _, q := range parsedQuery["fuzzy"] {
 			if len(filters) > 0 {
-				finalDocs = append(finalDocs, se.SearchOneTermWithFilter(q, page, filters)...)
+				finalDocs = append(finalDocs, se.SearchOneTermWithFilter(q, filters)...)
 			} else {
-				finalDocs = append(finalDocs, se.SearchOneTermWithoutFilter(q, page)...)
+				finalDocs = append(finalDocs, se.SearchOneTermWithoutFilter(q)...)
 			}
 		}
-		return &SearchResult{Docs: finalDocs}
+		limit := se.ResultSize
+		if len(finalDocs) < limit {
+			limit = len(finalDocs)
+		}
+		return &SearchResult{Docs: finalDocs[0:limit]}
 	}
 
-	return nil
+	limit := se.ResultSize
+	if len(finalDocs) < limit {
+		limit = len(finalDocs)
+	}
+	return &SearchResult{Docs: finalDocs[0:limit]}
 }
 
 // MultiTermSearch executes a multi-token query using grouped boolean search strategies.
 // Filter behavior preserved (original multi-term path did not apply filters).
-func (se *SearchEngine) MultiTermSearch(queryTokens []string, page int, filters map[string][]interface{}) *SearchResult {
-	returnedDocuments := make([]ReturnedDocument, 0, se.PageSize)
-	iteration := 1
-	maxIteration := 1
-	for {
-		returnedDocuments = append(returnedDocuments, se.multiTermSearchIteration(iteration, queryTokens, page, filters)...)
-		if len(returnedDocuments) >= se.PageSize*(page+1) || iteration >= maxIteration {
-			break
-		}
-		iteration++
-	}
-
-	sort.Slice(returnedDocuments, func(i, j int) bool {
-		if returnedDocuments[i].Score != returnedDocuments[j].Score {
-			return returnedDocuments[i].Score > returnedDocuments[j].Score
-		}
-		return returnedDocuments[i].ID < returnedDocuments[j].ID
-	})
-
-	return &SearchResult{Docs: returnedDocuments}
-}
-
-func (se *SearchEngine) multiTermSearchIteration(iteration int, queryTokens []string, page int, filters map[string][]interface{}) []ReturnedDocument {
+// First terms: Exact match + fuzzy(10)
+// Last term: Exact match + prefix(40)
+func (se *SearchEngine) MultiTermSearch(queryTokens []string, filters map[string][]interface{}) *SearchResult {
 	lastQueryIndex := len(queryTokens) - 1
 	rawFirstTerms := queryTokens[:lastQueryIndex]
 	rawLastTerm := queryTokens[lastQueryIndex]
@@ -1016,31 +994,35 @@ func (se *SearchEngine) multiTermSearchIteration(iteration int, queryTokens []st
 	termArrList := make([][]string, len(queryTokens))
 
 	for k, firstTerm := range rawFirstTerms {
-		_, ok := se.Keys.GetData()[firstTerm]
-		if ok {
+		if ok := se.Keys.Exists(firstTerm); ok {
 			termArrList[k] = []string{firstTerm}
 		}
-		termArrList[k] = append(termArrList[k], se.Symspell.FuzzySearch(firstTerm, 5*iteration*iteration)...)
+		termArrList[k] = append(termArrList[k], se.Symspell.FuzzySearch(firstTerm, 10)...)
+	}
+
+	if ok := se.Keys.Exists(rawLastTerm); ok {
+		termArrList[lastQueryIndex] = []string{rawLastTerm}
 	}
 
 	se.mu.RLock()
 	prefixLen := len(se.Prefix[rawLastTerm])
-	maxPrefix := 25 * iteration * iteration
+	maxPrefix := 40
 	if maxPrefix > prefixLen {
 		maxPrefix = prefixLen
 	}
 	lastTermGuessArr := append([]string(nil), se.Prefix[rawLastTerm][0:maxPrefix]...)
 	se.mu.RUnlock()
 
-	termArrList[lastQueryIndex] = lastTermGuessArr
-	if iteration > 1 || len(lastTermGuessArr) == 0 {
-		termArrList[lastQueryIndex] = append(termArrList[lastQueryIndex], se.Symspell.FuzzySearch(rawLastTerm, 5*iteration*iteration)...)
+	termArrList[lastQueryIndex] = append(termArrList[lastQueryIndex], lastTermGuessArr...)
+
+	var returnedDocuments []ReturnedDocument
+	if len(filters) > 0 {
+		returnedDocuments = se.SearchMultiTermsWithFilter(termArrList, filters)
+	} else {
+		returnedDocuments = se.SearchMultipleTermsWithoutFilter(termArrList)
 	}
 
-	if len(filters) > 0 {
-		return se.SearchMultiTermsWithFilter(termArrList, page, filters)
-	}
-	return se.SearchMultipleTermsWithoutFilter(termArrList, page)
+	return &SearchResult{Docs: returnedDocuments}
 }
 
 // AddOrUpdateDocument inserts or updates a single document.

@@ -17,6 +17,7 @@ func newTestEngineWithData(data map[string]map[uint32]bool) *SearchEngine {
 		mu:         sync.RWMutex{},
 		FilterDocs: data,
 		DocDeleted: make(map[uint32]bool),
+		ResultSize: 100,
 	}
 }
 
@@ -63,7 +64,7 @@ func newTestEngine() *SearchEngine {
 			2: "doc2",
 			3: "doc3",
 		},
-		PageSize: 2,
+		ResultSize: 100,
 	}
 	return se
 }
@@ -116,7 +117,7 @@ func newTestEngineForMultiTerm() *SearchEngine {
 			12: "doc12",
 			70: "doc70",
 		},
-		PageSize: 2,
+		ResultSize: 2,
 	}
 	return se
 }
@@ -124,7 +125,7 @@ func newTestEngineForMultiTerm() *SearchEngine {
 func TestSearchOneTermBasic(t *testing.T) {
 	se := newTestEngine()
 
-	res := se.SearchOneTermWithoutFilter("apple", 0)
+	res := se.SearchOneTermWithoutFilter("apple")
 	if len(res) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(res))
 	}
@@ -134,19 +135,10 @@ func TestSearchOneTermBasic(t *testing.T) {
 	}
 }
 
-func TestSearchOneTermPaging(t *testing.T) {
-	se := newTestEngine()
-
-	res := se.SearchOneTermWithoutFilter("apple", 1)
-	if len(res) != 0 {
-		t.Fatalf("expected empty page, got %+v", res)
-	}
-}
-
 func TestSearchOneTermDeleted(t *testing.T) {
 	se := newTestEngine()
 
-	res := se.SearchOneTermWithoutFilter("phone", 0)
+	res := se.SearchOneTermWithoutFilter("phone")
 	if len(res) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(res))
 	}
@@ -164,7 +156,7 @@ func TestSearchMultiTermAND_OR(t *testing.T) {
 		{"iphone", "phone", "phona"},
 	}
 
-	res := se.SearchMultipleTermsWithoutFilter(terms, 0)
+	res := se.SearchMultipleTermsWithoutFilter(terms)
 	if len(res) != 2 {
 		t.Fatalf("expected 2 result, got %d, res=%+v", len(res), res)
 	}
@@ -186,7 +178,7 @@ func TestSearchMultiTermScoreAggregation(t *testing.T) {
 		{"iphone"},
 	}
 
-	res := se.SearchMultipleTermsWithoutFilter(terms, 0)
+	res := se.SearchMultipleTermsWithoutFilter(terms)
 	if len(res) != 2 {
 		t.Fatalf("expected 2 result, got %d, res=%+v", len(res), res)
 	}
@@ -203,7 +195,7 @@ func TestSearchMultiTermScoreAggregation(t *testing.T) {
 func TestSearchMultiTermEmpty(t *testing.T) {
 	se := newTestEngine()
 
-	res := se.SearchMultipleTermsWithoutFilter([][]string{{"nonexistent"}}, 0)
+	res := se.SearchMultipleTermsWithoutFilter([][]string{{"nonexistent"}})
 	if res != nil {
 		t.Fatalf("expected nil result")
 	}
@@ -277,9 +269,9 @@ func TestAddOrUpdateAndDelete_E2E(t *testing.T) {
 	}
 
 	// 2) Exact-term searches should find what we indexed
-	assertIDs(t, se.SearchOneTermWithoutFilter("sunny", 0), "1")
-	assertIDs(t, se.SearchOneTermWithoutFilter("rio", 0), "1", "2")
-	assertIDs(t, se.SearchOneTermWithoutFilter("cloudy", 0), "3")
+	assertIDs(t, se.SearchOneTermWithoutFilter("sunny"), "1")
+	assertIDs(t, se.SearchOneTermWithoutFilter("rio"), "1", "2")
+	assertIDs(t, se.SearchOneTermWithoutFilter("cloudy"), "3")
 
 	// 3) Update doc2: remove "rio", add "sunny"
 	// Old internal version should become tombstoned, new version indexed.
@@ -293,19 +285,19 @@ func TestAddOrUpdateAndDelete_E2E(t *testing.T) {
 	}
 
 	// Now "rio" should no longer include doc2 (old internal is deleted)
-	assertIDs(t, se.SearchOneTermWithoutFilter("rio", 0), "1")
+	assertIDs(t, se.SearchOneTermWithoutFilter("rio"), "1")
 
 	// "sunny" should include doc1 and updated doc2
 	// (order not guaranteed, we compare as a set)
-	assertIDs(t, se.SearchOneTermWithoutFilter("sunny", 0), "1", "2")
+	assertIDs(t, se.SearchOneTermWithoutFilter("sunny"), "1", "2")
 
 	// 4) Delete doc1 and verify it disappears from results
 	if ok := se.DeleteDocument("1"); !ok {
 		t.Fatalf("DeleteDocument(1) expected true")
 	}
 
-	assertIDs(t, se.SearchOneTermWithoutFilter("sunny", 0), "2")
-	assertIDs(t, se.SearchOneTermWithoutFilter("rio", 0)) // empty
+	assertIDs(t, se.SearchOneTermWithoutFilter("sunny"), "2")
+	assertIDs(t, se.SearchOneTermWithoutFilter("rio")) // empty
 
 	// Deleting an unknown external ID should return false
 	if ok := se.DeleteDocument("does-not-exist"); ok {
@@ -322,12 +314,12 @@ func TestAddOrUpdateAndDelete_E2E(t *testing.T) {
 		t.Fatalf("AddOrUpdateDocument doc4: %v", err)
 	}
 
-	assertIDs(t, se.SearchOneTermWithoutFilter("rio", 0), "4")
-	assertIDs(t, se.SearchOneTermWithoutFilter("sunny", 0), "2", "4")
+	assertIDs(t, se.SearchOneTermWithoutFilter("rio"), "4")
+	assertIDs(t, se.SearchOneTermWithoutFilter("sunny"), "2", "4")
 
 	// 6) E2E via Search() as well (single term path)
 	// (Uses prefix/fuzzy expansion internally, but for these exact terms it should include the same docs.)
-	res := se.Search("sunny", 0, nil)
+	res := se.Search("sunny", nil)
 	if res == nil {
 		t.Fatalf("Search returned nil")
 	}
@@ -338,7 +330,7 @@ func TestAddOrUpdateAndDelete_E2E(t *testing.T) {
 	filters := map[string][]interface{}{
 		"genre": {"pop"},
 	}
-	res = se.Search("sunny", 0, filters)
+	res = se.Search("sunny", filters)
 	if res == nil {
 		t.Fatalf("Search (filtered) returned nil")
 	}
@@ -347,16 +339,7 @@ func TestAddOrUpdateAndDelete_E2E(t *testing.T) {
 	assertIDs(t, res.Docs, "2")
 
 	// Extra safety: leaf filtered function should always work if present.
-	assertIDs(t, se.SearchOneTermWithFilter("sunny", 0, filters), "2")
-}
-
-func docIDs(docs []ReturnedDocument) []string {
-	out := make([]string, 0, len(docs))
-	for _, d := range docs {
-		out = append(out, d.ID)
-	}
-	sort.Strings(out)
-	return out
+	assertIDs(t, se.SearchOneTermWithFilter("sunny", filters), "2")
 }
 
 func containsString(arr []string, s string) bool {
@@ -407,8 +390,8 @@ func TestSaveLoad_RebuildsIndexesFromDocuments(t *testing.T) {
 	}
 
 	// Sanity before save
-	assertIDs(t, se.SearchOneTermWithoutFilter("sunny", 0), "2")
-	assertIDs(t, se.SearchOneTermWithoutFilter("rio", 0)) // should be empty now
+	assertIDs(t, se.SearchOneTermWithoutFilter("sunny"), "2")
+	assertIDs(t, se.SearchOneTermWithoutFilter("rio")) // should be empty now
 
 	// 2) Save to temp dir
 	dir := t.TempDir()
@@ -430,8 +413,8 @@ func TestSaveLoad_RebuildsIndexesFromDocuments(t *testing.T) {
 	}
 
 	// Metadata restored
-	if loaded.PageSize != 10 {
-		t.Fatalf("PageSize mismatch: got=%d exp=%d", loaded.PageSize, 10)
+	if loaded.ResultSize != 10 {
+		t.Fatalf("PageSize mismatch: got=%d exp=%d", loaded.ResultSize, 10)
 	}
 	if len(loaded.IndexFields) != 1 || loaded.IndexFields[0] != "name" {
 		t.Fatalf("IndexFields mismatch: got=%v", loaded.IndexFields)
@@ -441,13 +424,13 @@ func TestSaveLoad_RebuildsIndexesFromDocuments(t *testing.T) {
 	}
 
 	// Searches work (meaning DataMap rebuilt and tombstones respected)
-	assertIDs(t, loaded.SearchOneTermWithoutFilter("sunny", 0), "2")
-	assertIDs(t, loaded.SearchOneTermWithoutFilter("rio", 0)) // empty
+	assertIDs(t, loaded.SearchOneTermWithoutFilter("sunny"), "2")
+	assertIDs(t, loaded.SearchOneTermWithoutFilter("rio")) // empty
 
 	// Filter logic rebuilt
-	filtered := loaded.SearchOneTermWithFilter("sunny", 0, map[string][]interface{}{"year": {"2021"}})
+	filtered := loaded.SearchOneTermWithFilter("sunny", map[string][]interface{}{"year": {"2021"}})
 	assertIDs(t, filtered, "2")
-	filtered = loaded.SearchOneTermWithFilter("sunny", 0, map[string][]interface{}{"year": {"2020"}})
+	filtered = loaded.SearchOneTermWithFilter("sunny", map[string][]interface{}{"year": {"2020"}})
 	assertIDs(t, filtered) // empty
 
 	// Derived structures sanity checks (not exhaustive, but ensures rebuild happened)
@@ -492,6 +475,254 @@ func TestSaveLoad_RebuildsIndexesFromDocuments(t *testing.T) {
 		t.Fatalf("AddOrUpdateDocument doc3 after load: %v", err)
 	}
 
-	assertIDs(t, loaded.SearchOneTermWithoutFilter("rio", 0), "3")
-	assertIDs(t, loaded.SearchOneTermWithoutFilter("sunny", 0), "2", "3")
+	assertIDs(t, loaded.SearchOneTermWithoutFilter("rio"), "3")
+	assertIDs(t, loaded.SearchOneTermWithoutFilter("sunny"), "2", "3")
+}
+
+func TestMultiTermSearch_E2E(t *testing.T) {
+	se := NewSearchEngine(
+		[]string{"title", "tags"},      // indexed fields
+		map[string]bool{"genre": true}, // filters
+		10,
+	)
+
+	// 1) Insert documents
+	docs := []map[string]interface{}{
+		{
+			"id":    "1",
+			"title": "Apple iPhone Pro",
+			"genre": "tech",
+			"tags":  "phone mobile",
+		},
+		{
+			"id":    "2",
+			"title": "Apple Phone Basic",
+			"genre": "tech",
+			"tags":  "phone mobile",
+		},
+		{
+			"id":    "3",
+			"title": "Samsung Phone",
+			"genre": "tech",
+			"tags":  "phone mobile",
+		},
+		{
+			"id":    "4",
+			"title": "Apple Banana",
+			"genre": "food",
+			"tags":  "fruit",
+		},
+	}
+
+	for _, d := range docs {
+		if err := se.AddOrUpdateDocument(d); err != nil {
+			t.Fatalf("AddOrUpdateDocument failed: %v", err)
+		}
+	}
+
+	// 2) Multi-term search
+	// Query: "apple phone"
+	// Expected logic:
+	// AND across terms:
+	//   must match BOTH "apple" AND "phone"
+	//
+	// Matching docs:
+	// - doc1: "Apple iPhone Pro" (iphone fuzzy/prefix match)
+	// - doc2: "Apple Phone Basic"
+	// - doc4: "Apple Banana" -> excluded (no phone)
+	// - doc3: "Samsung Phone" -> excluded (no apple)
+
+	res := se.Search("apple phone", nil)
+	if res == nil {
+		t.Fatalf("Search returned nil")
+	}
+
+	assertIDs(t, res.Docs, "1", "2")
+
+	// 3) Filtered multi-term search
+	// Only genre=tech → still doc1 + doc2
+	filters := map[string][]interface{}{
+		"genre": {"tech"},
+	}
+
+	res = se.Search("apple phone", filters)
+	if res == nil {
+		t.Fatalf("Filtered search returned nil")
+	}
+
+	assertIDs(t, res.Docs, "1", "2")
+
+	// 4) Filter that excludes one result
+	// genre=food → should remove both (since neither doc1/doc2 are food)
+	filters = map[string][]interface{}{
+		"genre": {"food"},
+	}
+
+	res = se.Search("apple phone", filters)
+	if res == nil {
+		t.Fatalf("Filtered search returned nil")
+	}
+
+	assertIDs(t, res.Docs) // expect empty
+}
+
+func TestMultiTermSearch_E2E_WithScoringOrder(t *testing.T) {
+	se := NewSearchEngine(
+		[]string{"title", "tags"},
+		map[string]bool{"genre": true},
+		10,
+	)
+
+	// 1) Insert documents with intentional scoring differences
+	// We control score via:
+	// - repeated tokens
+	// - multiple fields
+	// - token count normalization
+
+	docs := []map[string]interface{}{
+		{
+			"id":    "1",
+			"title": "apple phone phone", // phone twice
+			"tags":  "phone mobile",      // +1 phone
+			"genre": "tech",
+		},
+		{
+			"id":    "2",
+			"title": "apple phone", // phone once
+			"tags":  "phone",       // +1 phone
+			"genre": "tech",
+		},
+		{
+			"id":    "3",
+			"title": "apple device",
+			"tags":  "phone", // phone only in tags
+			"genre": "tech",
+		},
+		{
+			"id":    "4",
+			"title": "apple something else",
+			"tags":  "other",
+			"genre": "tech",
+		},
+	}
+
+	for _, d := range docs {
+		if err := se.AddOrUpdateDocument(d); err != nil {
+			t.Fatalf("AddOrUpdateDocument failed: %v", err)
+		}
+	}
+
+	// 2) Multi-term search
+	// appre -> system will fuzzy fix it as apple
+	// pho -> system will find the word phone for prefix pho
+	res := se.Search("appre pho", nil)
+	if res == nil {
+		t.Fatalf("Search returned nil")
+	}
+
+	if len(res.Docs) != 3 {
+		t.Fatalf("expected 3 results, got %d: %+v", len(res.Docs), res.Docs)
+	}
+
+	gotOrder := []string{
+		res.Docs[0].ID,
+		res.Docs[1].ID,
+		res.Docs[2].ID,
+	}
+
+	expectedOrder := []string{"2", "1", "3"}
+
+	for i := range expectedOrder {
+		if gotOrder[i] != expectedOrder[i] {
+			t.Fatalf("unexpected ranking order: got=%v expected=%v", gotOrder, expectedOrder)
+		}
+	}
+
+	// 3) Extra: assert strictly descending scores (stronger check)
+	if !(res.Docs[0].Score >= res.Docs[1].Score &&
+		res.Docs[1].Score >= res.Docs[2].Score) {
+		t.Fatalf("scores not sorted descending: %+v", res.Docs)
+	}
+}
+
+func TestIndex_MultipleBatches(t *testing.T) {
+	se := NewSearchEngine(
+		[]string{"title", "tags"},
+		map[string]bool{"genre": true},
+		10,
+	)
+
+	// First batch
+	batch1 := []map[string]interface{}{
+		{
+			"id":    "1",
+			"title": "Apple Phone",
+			"tags":  "mobile tech",
+			"genre": "tech",
+		},
+		{
+			"id":    "2",
+			"title": "Samsung Tablet",
+			"tags":  "device tech",
+			"genre": "tech",
+		},
+	}
+
+	// Second batch
+	batch2 := []map[string]interface{}{
+		{
+			"id":    "3",
+			"title": "Banana Fruit",
+			"tags":  "food yellow",
+			"genre": "food",
+		},
+		{
+			"id":    "4",
+			"title": "Gaming Laptop",
+			"tags":  "computer performance",
+			"genre": "gaming",
+		},
+	}
+
+	// Index first batch
+	se.Index(batch1)
+
+	// Index second batch
+	se.Index(batch2)
+
+	// Verify all docs searchable
+	tests := []struct {
+		query      string
+		expectedID string
+	}{
+		{"apple", "1"},
+		{"samsung", "2"},
+		{"banana", "3"},
+		{"gaming", "4"},
+	}
+
+	for _, tt := range tests {
+		res := se.Search(tt.query, nil)
+
+		if res == nil {
+			t.Fatalf("search returned nil for query %q", tt.query)
+		}
+
+		if len(res.Docs) == 0 {
+			t.Fatalf("expected results for query %q", tt.query)
+		}
+
+		found := false
+		for _, d := range res.Docs {
+			if d.ID == tt.expectedID {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			t.Fatalf("expected doc %s for query %q, got %+v",
+				tt.expectedID, tt.query, res.Docs)
+		}
+	}
 }
