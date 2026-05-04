@@ -5,6 +5,7 @@
 package engine
 
 import (
+	"container/heap"
 	"encoding/gob"
 	"fmt"
 	"os"
@@ -19,6 +20,24 @@ import (
 	"github.com/mg52/search/internal/pkg/symspell"
 	"github.com/mg52/search/internal/pkg/trie"
 )
+
+type minHeap []internalHit
+
+func (h minHeap) Len() int           { return len(h) }
+func (h minHeap) Less(i, j int) bool { return h[i].score < h[j].score } // min-heap
+func (h minHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+
+func (h *minHeap) Push(x any) {
+	*h = append(*h, x.(internalHit))
+}
+
+func (h *minHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
 
 type internalHit struct {
 	id    uint32
@@ -515,47 +534,99 @@ func (se *SearchEngine) addToDocumentIndex(term string, internalDocID uint32, le
 
 // -------------------- Search --------------------
 
+// func (se *SearchEngine) SearchOneTermWithoutFilter(query string) []ReturnedDocument {
+// 	se.mu.RLock()
+// 	defer se.mu.RUnlock()
+
+// 	postingsByDoc := se.DataMap[query]
+// 	if postingsByDoc == nil {
+// 		return nil
+// 	}
+
+// 	hits := make([]internalHit, 0)
+
+// 	for internalID, score := range postingsByDoc {
+// 		if se.DocDeleted[internalID] {
+// 			continue
+// 		}
+
+// 		hits = append(hits, internalHit{id: internalID, score: score})
+// 	}
+
+// 	if len(hits) == 0 {
+// 		return nil
+// 	}
+
+// 	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
+
+// 	end := se.ResultSize
+// 	if end > len(hits) {
+// 		end = len(hits)
+// 	}
+
+// 	out := make([]ReturnedDocument, 0, end)
+// 	for _, hit := range hits[0:end] {
+// 		extID := se.InternalToExternal[hit.id]
+// 		out = append(out, ReturnedDocument{
+// 			ID:    extID,
+// 			Data:  se.Documents[hit.id],
+// 			Score: hit.score,
+// 		})
+// 	}
+// 	return out
+// }
+
 // SearchOneTermWithoutFilter retrieves results for a single term.
 // Search holds RLock for the whole function to avoid concurrent map read/write panics.
 func (se *SearchEngine) SearchOneTermWithoutFilter(query string) []ReturnedDocument {
 	se.mu.RLock()
 	defer se.mu.RUnlock()
 
-	postingsByDoc := se.DataMap[query]
-	if postingsByDoc == nil {
+	postings := se.DataMap[query]
+	if postings == nil {
 		return nil
 	}
 
-	hits := make([]internalHit, 0)
+	k := se.ResultSize
+	if k <= 0 {
+		return nil
+	}
 
-	for internalID, score := range postingsByDoc {
-		if se.DocDeleted[internalID] {
+	h := &minHeap{}
+	heap.Init(h)
+
+	for id, score := range postings {
+		if se.DocDeleted[id] {
 			continue
 		}
 
-		hits = append(hits, internalHit{id: internalID, score: score})
+		if h.Len() < k {
+			heap.Push(h, internalHit{id: id, score: score})
+		} else if (*h)[0].score < score {
+			heap.Pop(h)
+			heap.Push(h, internalHit{id: id, score: score})
+		}
 	}
 
-	if len(hits) == 0 {
+	if h.Len() == 0 {
 		return nil
 	}
 
-	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
+	// extract results (reverse to highest-first)
+	n := h.Len()
+	out := make([]ReturnedDocument, n)
 
-	end := se.ResultSize
-	if end > len(hits) {
-		end = len(hits)
-	}
-
-	out := make([]ReturnedDocument, 0, end)
-	for _, hit := range hits[0:end] {
+	for i := n - 1; i >= 0; i-- {
+		hit := heap.Pop(h).(internalHit)
 		extID := se.InternalToExternal[hit.id]
-		out = append(out, ReturnedDocument{
+
+		out[i] = ReturnedDocument{
 			ID:    extID,
 			Data:  se.Documents[hit.id],
 			Score: hit.score,
-		})
+		}
 	}
+
 	return out
 }
 

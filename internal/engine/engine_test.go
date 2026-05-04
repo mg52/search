@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"container/heap"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -724,5 +725,118 @@ func TestIndex_MultipleBatches(t *testing.T) {
 			t.Fatalf("expected doc %s for query %q, got %+v",
 				tt.expectedID, tt.query, res.Docs)
 		}
+	}
+}
+
+func TestMinHeap_PushPopOrder(t *testing.T) {
+	h := &minHeap{}
+
+	heap.Init(h)
+
+	input := []internalHit{
+		{id: 1, score: 50},
+		{id: 2, score: 10},
+		{id: 3, score: 30},
+		{id: 4, score: 5},
+		{id: 5, score: 20},
+	}
+
+	for _, v := range input {
+		heap.Push(h, v)
+	}
+
+	expectedOrder := []int{5, 10, 20, 30, 50}
+
+	for _, want := range expectedOrder {
+		got := heap.Pop(h).(internalHit)
+		if got.score != want {
+			t.Errorf("expected %v, got %v", want, got.score)
+		}
+	}
+}
+
+func TestMinHeap_Len(t *testing.T) {
+	h := &minHeap{}
+	heap.Init(h)
+
+	if h.Len() != 0 {
+		t.Fatalf("expected empty heap")
+	}
+
+	heap.Push(h, internalHit{id: 1, score: 10})
+	heap.Push(h, internalHit{id: 2, score: 20})
+
+	if h.Len() != 2 {
+		t.Fatalf("expected len 2, got %d", h.Len())
+	}
+}
+
+func TestMinHeap_SingleElement(t *testing.T) {
+	h := &minHeap{}
+	heap.Init(h)
+
+	heap.Push(h, internalHit{id: 1, score: 42})
+
+	x := heap.Pop(h).(internalHit)
+
+	if x.score != 42 {
+		t.Errorf("expected 42, got %v", x.score)
+	}
+
+	if h.Len() != 0 {
+		t.Errorf("expected empty heap after pop")
+	}
+}
+
+func TestMinHeap_StabilityRandomInsertions(t *testing.T) {
+	h := &minHeap{}
+	heap.Init(h)
+
+	values := []int{100, 1, 50, 2, 99, 3, 75, 4, 60}
+
+	for i, v := range values {
+		heap.Push(h, internalHit{id: uint32(i), score: v})
+	}
+
+	last := -1
+
+	for h.Len() > 0 {
+		x := heap.Pop(h).(internalHit)
+		if last > x.score {
+			t.Errorf("heap order violated: %v came after %v", x.score, last)
+		}
+		last = x.score
+	}
+}
+
+func TestMinHeap_StabilityRandomInsertions2(t *testing.T) {
+	h := &minHeap{}
+	heap.Init(h)
+
+	values := []int{100, 105, 1, 50, 2, 99, 101, 3, 75, 4, 60, 104, 110, 95, 90, 90, 106, 8, 111, 101, 106, 79}
+
+	k := 5
+	for i, score := range values {
+		if h.Len() < k {
+			heap.Push(h, internalHit{id: uint32(i), score: score})
+		} else if (*h)[0].score < score {
+			heap.Pop(h)
+			heap.Push(h, internalHit{id: uint32(i), score: score})
+		}
+	}
+
+	last := -1
+
+	var scores []int
+	for h.Len() > 0 {
+		x := heap.Pop(h).(internalHit)
+		if last > x.score {
+			t.Errorf("heap order violated: %v came after %v", x.score, last)
+		}
+		last = x.score
+		scores = append(scores, x.score)
+	}
+	if scores[0] != 105 || scores[1] != 106 || scores[2] != 106 || scores[3] != 110 || scores[4] != 111 {
+		t.Errorf("Score violated")
 	}
 }

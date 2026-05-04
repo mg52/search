@@ -97,3 +97,33 @@ func TestDeleteWord_RemovesWordAndVariants(t *testing.T) {
 		t.Errorf("FuzzySearch(\"lack\") = %v; want %v", got, want)
 	}
 }
+
+func TestSymSpell_FuzzySearch_FirstLastChar(t *testing.T) {
+	// Prepare dictionary
+	words := []string{"iphone", "phane", "phone1"}
+	ss := NewSymSpell()
+	ss.LoadDictionary(words)
+
+	tests := []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{
+			name:  "Substitution",
+			query: "phone",
+			want:  []string{"iphone", "phane", "phone1"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ss.FuzzySearch(tc.query, 5)
+			sort.Strings(got)
+			sort.Strings(tc.want)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("FuzzySearch(%q) = %v; want %v", tc.query, got, tc.want)
+			}
+		})
+	}
+}
