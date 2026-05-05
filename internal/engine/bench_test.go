@@ -1,31 +1,19 @@
-// loadtest hammers the search endpoint with realistic queries drawn from the
-// same vocabulary used by the engine benchmarks. It reports aggregate latency
-// (avg/p50/p95/p99), RPS, and a per-mode breakdown (single/multi × no-filter/filter).
-//
-// Usage:
-//
-//	go run ./loadtest -url http://localhost:8080/search -index bench -requests 10000
-package main
+package engine
 
 import (
-	"context"
-	"flag"
 	"fmt"
 	"math/rand"
-	"net/http"
-	"net/url"
-	"os"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
+	"testing"
 	"time"
 )
 
-// ---- vocabulary (same as datagen / bench_test.go) ----
+// ---- vocabulary (1000+ unique words) ----
 
-var vocab = func() []string {
+var benchVocab = func() []string {
 	raw := `
 ability absent accept access account achieve across active actual address
 adjust advance advice affect afford afraid agency agree ahead albeit alert
@@ -141,7 +129,7 @@ empower endow epoch fertile harvest pinnacle zenith azure cobalt silver
 	return unique
 }()
 
-// ---- query helpers ----
+// ---- helpers ----
 
 func misspellWord(r *rand.Rand, word string) string {
 	runes := []rune(word)
@@ -150,13 +138,13 @@ func misspellWord(r *rand.Rand, word string) string {
 		return word
 	}
 	switch r.Intn(3) {
-	case 0:
+	case 0: // swap two adjacent chars
 		i := r.Intn(n - 1)
 		runes[i], runes[i+1] = runes[i+1], runes[i]
-	case 1:
+	case 1: // delete one char
 		i := r.Intn(n)
 		runes = append(runes[:i], runes[i+1:]...)
-	case 2:
+	case 2: // double one char (insert duplicate)
 		i := r.Intn(n)
 		runes = append(runes[:i+1], append([]rune{runes[i]}, runes[i+1:]...)...)
 	}
@@ -167,6 +155,7 @@ func prefixOfWord(r *rand.Rand, word string) string {
 	if len(word) <= 4 {
 		return word
 	}
+	// keep 3 to len-2 characters so it's a genuine prefix, not the full word
 	minLen := 3
 	maxLen := len(word) - 1
 	if maxLen <= minLen {
@@ -175,275 +164,216 @@ func prefixOfWord(r *rand.Rand, word string) string {
 	return word[:minLen+r.Intn(maxLen-minLen)]
 }
 
-// singleTermQuery returns one query token: 10% misspell, 25% prefix, 65% exact.
-func singleTermQuery(r *rand.Rand) string {
-	word := vocab[r.Intn(len(vocab))]
-	roll := r.Float64()
-	switch {
-	case roll < 0.10:
-		return misspellWord(r, word)
-	case roll < 0.35:
-		return prefixOfWord(r, word)
-	default:
-		return word
-	}
-}
-
-// multiTermQuery returns 2-4 tokens joined by space.
-// 10% chance one token is misspelled; last token is a prefix 25% of the time.
-func multiTermQuery(r *rand.Rand) string {
-	nTerms := 2 + r.Intn(3)
-	terms := make([]string, nTerms)
-	misspellIdx := -1
-	if r.Float64() < 0.10 {
-		misspellIdx = r.Intn(nTerms)
-	}
-	for j := 0; j < nTerms; j++ {
-		w := vocab[r.Intn(len(vocab))]
+// buildSingleQueries returns count single-term query strings.
+// 10% misspellings, 25% prefix, rest exact.
+func buildSingleQueries(r *rand.Rand, vocab []string, count int) []string {
+	qs := make([]string, count)
+	for i := range qs {
+		word := vocab[r.Intn(len(vocab))]
+		roll := r.Float64()
 		switch {
-		case j == misspellIdx:
-			w = misspellWord(r, w)
-		case j == nTerms-1 && r.Float64() < 0.25:
-			w = prefixOfWord(r, w)
+		case roll < 0.10:
+			word = misspellWord(r, word)
+		case roll < 0.35:
+			word = prefixOfWord(r, word)
 		}
-		terms[j] = w
+		qs[i] = word
 	}
-	return strings.Join(terms, " ")
+	return qs
 }
 
-func yearFilter(r *rand.Rand) string {
-	return fmt.Sprintf("year:%d", 2000+r.Intn(25))
-}
-
-// ---- result tracking ----
-
-type modeKey struct {
-	multi  bool
-	filter bool
-}
-
-func (m modeKey) String() string {
-	q := "Single"
-	if m.multi {
-		q = "Multi "
-	}
-	f := "NoFilter"
-	if m.filter {
-		f = "Filter  "
-	}
-	return q + " / " + f
-}
-
-type result struct {
-	lat  time.Duration
-	mode modeKey
-	err  bool
-}
-
-// ---- main ----
-
-func main() {
-	baseURL := flag.String("url", "http://localhost:8080/search", "Search endpoint URL")
-	indexName := flag.String("index", "bench", "Index name (?index=)")
-	workers := flag.Int("workers", 8, "Number of parallel workers")
-	requests := flag.Int("requests", 10_000, "Total requests to send")
-	timeout := flag.Duration("timeout", 10*time.Second, "Per-request HTTP timeout")
-	seed := flag.Int64("seed", time.Now().UnixNano(), "Random seed")
-	keepAlive := flag.Bool("keepalive", true, "Use HTTP keep-alive")
-	filterPct := flag.Int("filter-pct", 50, "Percentage of requests that include a year filter (0-100)")
-	multiPct := flag.Int("multi-pct", 50, "Percentage of requests that use multi-term queries (0-100)")
-	flag.Parse()
-
-	tr := &http.Transport{
-		DisableKeepAlives:   !*keepAlive,
-		MaxIdleConns:        1000,
-		MaxConnsPerHost:     0,
-		MaxIdleConnsPerHost: 1000,
-		IdleConnTimeout:     90 * time.Second,
-	}
-	client := &http.Client{Timeout: *timeout, Transport: tr}
-
-	var sent int64
-	total := int64(*requests)
-
-	results := make([]result, 0, *requests)
-	var resultsMu sync.Mutex
-	var errCount int64
-
-	fmt.Printf("Target:   %s  index=%s\n", *baseURL, *indexName)
-	fmt.Printf("Workers:  %d  |  Requests: %d  |  filter-pct: %d%%  |  multi-pct: %d%%\n",
-		*workers, *requests, *filterPct, *multiPct)
-	fmt.Println("Starting...")
-
-	startAll := time.Now()
-	var wg sync.WaitGroup
-	wg.Add(*workers)
-
-	for w := 0; w < *workers; w++ {
-		go func(workerID int) {
-			defer wg.Done()
-			r := rand.New(rand.NewSource(*seed + int64(workerID)*1_000_003))
-
-			for {
-				i := atomic.AddInt64(&sent, 1)
-				if i > total {
-					return
-				}
-
-				isMulti := r.Intn(100) < *multiPct
-				isFilter := r.Intn(100) < *filterPct
-
-				var q string
-				if isMulti {
-					q = multiTermQuery(r)
-				} else {
-					q = singleTermQuery(r)
-				}
-
-				reqURL := buildURL(*baseURL, *indexName, q, isFilter, r)
-
-				t0 := time.Now()
-				req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, reqURL, nil)
-				resp, err := client.Do(req)
-				lat := time.Since(t0)
-
-				res := result{
-					lat:  lat,
-					mode: modeKey{multi: isMulti, filter: isFilter},
-					err:  err != nil,
-				}
-
-				if err != nil {
-					atomic.AddInt64(&errCount, 1)
-				} else {
-					if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-						atomic.AddInt64(&errCount, 1)
-						res.err = true
-					}
-					_ = resp.Body.Close()
-				}
-
-				resultsMu.Lock()
-				results = append(results, res)
-				resultsMu.Unlock()
+// buildMultiQueries returns count multi-term query strings (2–4 terms).
+// 10% of queries have one misspelled word; last word is prefix 25% of the time.
+func buildMultiQueries(r *rand.Rand, vocab []string, count int) []string {
+	qs := make([]string, count)
+	for i := range qs {
+		nTerms := 2 + r.Intn(3) // 2, 3, or 4
+		terms := make([]string, nTerms)
+		misspellIdx := -1
+		if r.Float64() < 0.10 {
+			misspellIdx = r.Intn(nTerms)
+		}
+		for j := 0; j < nTerms; j++ {
+			w := vocab[r.Intn(len(vocab))]
+			if j == misspellIdx {
+				w = misspellWord(r, w)
+			} else if j == nTerms-1 && r.Float64() < 0.25 {
+				w = prefixOfWord(r, w)
 			}
-		}(w)
-	}
-
-	wg.Wait()
-	elapsed := time.Since(startAll)
-
-	if len(results) == 0 {
-		fmt.Println("No results collected.")
-		os.Exit(1)
-	}
-
-	// ---- overall stats ----
-	allLats := make([]time.Duration, len(results))
-	for i, r := range results {
-		allLats[i] = r.lat
-	}
-	sort.Slice(allLats, func(i, j int) bool { return allLats[i] < allLats[j] })
-
-	rps := float64(len(results)) / elapsed.Seconds()
-
-	fmt.Printf("\n──────────────────────────────────────────────────────\n")
-	fmt.Printf("Requests: %-6d  Workers: %-3d  Errors: %-4d  GOMAXPROCS: %d\n",
-		len(results), *workers, atomic.LoadInt64(&errCount), runtime.GOMAXPROCS(0))
-	fmt.Printf("Wall time: %-12s  RPS: %.1f\n", elapsed.Round(time.Millisecond), rps)
-	fmt.Printf("──────────────────────────────────────────────────────\n")
-	fmt.Println("Overall latency:")
-	printLatencyRow("  all", allLats)
-
-	// ---- per-mode breakdown ----
-	byMode := make(map[modeKey][]time.Duration)
-	for _, r := range results {
-		byMode[r.mode] = append(byMode[r.mode], r.lat)
-	}
-
-	modes := []modeKey{
-		{multi: false, filter: false},
-		{multi: false, filter: true},
-		{multi: true, filter: false},
-		{multi: true, filter: true},
-	}
-
-	fmt.Printf("\nPer-mode breakdown:\n")
-	fmt.Printf("  %-24s  %8s  %8s  %8s  %8s  %6s\n", "mode", "avg", "p50", "p95", "p99", "count")
-	fmt.Printf("  %-24s  %8s  %8s  %8s  %8s  %6s\n", "----", "---", "---", "---", "---", "-----")
-	for _, m := range modes {
-		lats := byMode[m]
-		if len(lats) == 0 {
-			continue
+			terms[j] = w
 		}
-		sort.Slice(lats, func(i, j int) bool { return lats[i] < lats[j] })
-		fmt.Printf("  %-24s  %8s  %8s  %8s  %8s  %6d\n",
-			m,
-			fmtMs(average(lats)),
-			fmtMs(pct(lats, 50)),
-			fmtMs(pct(lats, 95)),
-			fmtMs(pct(lats, 99)),
-			len(lats),
-		)
+		qs[i] = strings.Join(terms, " ")
 	}
-	fmt.Printf("──────────────────────────────────────────────────────\n")
+	return qs
 }
 
-func buildURL(base, index, q string, addFilter bool, r *rand.Rand) string {
-	u, err := url.Parse(base)
-	if err != nil {
-		return base
+// buildYearFilters returns count year filter maps cycling through 2000–2024.
+func buildYearFilters(r *rand.Rand, count int) []map[string][]interface{} {
+	fs := make([]map[string][]interface{}, count)
+	for i := range fs {
+		year := 2000 + r.Intn(25)
+		fs[i] = map[string][]interface{}{"year": {year}}
 	}
-	params := u.Query()
-	params.Set("index", index)
-	params.Set("q", q)
-	if addFilter {
-		params.Set("filter", yearFilter(r))
-	}
-	u.RawQuery = params.Encode()
-	return u.String()
+	return fs
 }
 
-func printLatencyRow(label string, sorted []time.Duration) {
-	fmt.Printf("  %-8s  avg=%-10s  p50=%-10s  p95=%-10s  p99=%s\n",
-		label,
-		fmtMs(average(sorted)),
-		fmtMs(pct(sorted, 50)),
-		fmtMs(pct(sorted, 95)),
-		fmtMs(pct(sorted, 99)),
+// ---- corpus ----
+
+const queryPoolSize = 1000
+
+type benchCorpus struct {
+	engine      *SearchEngine
+	heapMB      float64
+	singleExact []string
+	multiExact  []string
+	yearFilters []map[string][]interface{}
+}
+
+var (
+	corpus1M benchCorpus
+	once1M   sync.Once
+	corpus5M benchCorpus
+	once5M   sync.Once
+)
+
+func getCorpus(n int) *benchCorpus {
+	switch n {
+	case 1_000_000:
+		once1M.Do(func() { corpus1M = buildRealisticCorpus(1_000_000) })
+		return &corpus1M
+	case 5_000_000:
+		once5M.Do(func() { corpus5M = buildRealisticCorpus(5_000_000) })
+		return &corpus5M
+	}
+	panic(fmt.Sprintf("unknown corpus size: %d", n))
+}
+
+func buildRealisticCorpus(n int) benchCorpus {
+	r := rand.New(rand.NewSource(42))
+
+	se := NewSearchEngine(
+		[]string{"title", "tags"},
+		map[string]bool{"year": true},
+		100,
 	)
-}
 
-func fmtMs(d time.Duration) string {
-	return fmt.Sprintf("%.2fms", float64(d)/float64(time.Millisecond))
-}
+	docs := make([]map[string]interface{}, n)
+	for i := 0; i < n; i++ {
+		nTitle := 3 + r.Intn(18) // 3–20 words
+		titleParts := make([]string, nTitle)
+		for j := range titleParts {
+			titleParts[j] = benchVocab[r.Intn(len(benchVocab))]
+		}
 
-func average(lats []time.Duration) time.Duration {
-	var sum int64
-	for _, d := range lats {
-		sum += int64(d)
+		nTags := 1 + r.Intn(10) // 1–10 words
+		tagParts := make([]string, nTags)
+		for j := range tagParts {
+			tagParts[j] = benchVocab[r.Intn(len(benchVocab))]
+		}
+
+		docs[i] = map[string]interface{}{
+			"id":    fmt.Sprintf("d%d", i),
+			"title": strings.Join(titleParts, " "),
+			"tags":  strings.Join(tagParts, " "),
+			"year":  2000 + r.Intn(25),
+		}
 	}
-	return time.Duration(sum / int64(len(lats)))
+
+	runtime.GC()
+	var m0 runtime.MemStats
+	runtime.ReadMemStats(&m0)
+
+	se.Index(docs)
+
+	runtime.GC()
+	var m1 runtime.MemStats
+	runtime.ReadMemStats(&m1)
+	heapMB := float64(m1.HeapInuse-m0.HeapInuse) / (1024 * 1024)
+
+	qr := rand.New(rand.NewSource(99))
+	return benchCorpus{
+		engine:      se,
+		heapMB:      heapMB,
+		singleExact: buildSingleQueries(qr, benchVocab, queryPoolSize),
+		multiExact:  buildMultiQueries(qr, benchVocab, queryPoolSize),
+		yearFilters: buildYearFilters(qr, queryPoolSize),
+	}
 }
 
-func pct(sorted []time.Duration, p int) time.Duration {
+// ---- latency helpers ----
+
+func pct(sorted []int64, p float64) int64 {
 	if len(sorted) == 0 {
 		return 0
 	}
-	if p <= 0 {
-		return sorted[0]
-	}
-	if p >= 100 {
-		return sorted[len(sorted)-1]
-	}
-	n := len(sorted)
-	k := (p*n + 99) / 100
-	idx := k - 1
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= n {
-		idx = n - 1
-	}
+	idx := int(float64(len(sorted)-1) * p)
 	return sorted[idx]
+}
+
+// runAndMeasure runs b.N iterations of fn, reports p50/p99 via ReportMetric,
+// and returns so testing.B can report ns/op, B/op, allocs/op normally.
+func runAndMeasure(b *testing.B, fn func()) {
+	b.Helper()
+	lats := make([]int64, 0, b.N)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		t := time.Now()
+		fn()
+		lats = append(lats, time.Since(t).Nanoseconds())
+	}
+	b.StopTimer()
+	sort.Slice(lats, func(i, j int) bool { return lats[i] < lats[j] })
+	b.ReportMetric(float64(pct(lats, 0.50)), "p50_ns")
+	b.ReportMetric(float64(pct(lats, 0.99)), "p99_ns")
+}
+
+// ---- benchmarks ----
+
+func BenchmarkSearch1M(b *testing.B) { runSearchBench(b, 1_000_000) }
+func BenchmarkSearch5M(b *testing.B) { runSearchBench(b, 5_000_000) }
+
+func runSearchBench(b *testing.B, n int) {
+	b.Helper()
+	c := getCorpus(n)
+	label := fmt.Sprintf("%dM_docs", n/1_000_000)
+
+	b.Run(fmt.Sprintf("SingleTerm/NoFilter/%s", label), func(b *testing.B) {
+		b.ReportAllocs()
+		b.ReportMetric(c.heapMB, "heap_MB")
+		idx := 0
+		runAndMeasure(b, func() {
+			_ = c.engine.Search(c.singleExact[idx%queryPoolSize], nil)
+			idx++
+		})
+	})
+
+	b.Run(fmt.Sprintf("SingleTerm/Filter/%s", label), func(b *testing.B) {
+		b.ReportAllocs()
+		b.ReportMetric(c.heapMB, "heap_MB")
+		idx := 0
+		runAndMeasure(b, func() {
+			_ = c.engine.Search(c.singleExact[idx%queryPoolSize], c.yearFilters[idx%queryPoolSize])
+			idx++
+		})
+	})
+
+	b.Run(fmt.Sprintf("MultiTerm/NoFilter/%s", label), func(b *testing.B) {
+		b.ReportAllocs()
+		b.ReportMetric(c.heapMB, "heap_MB")
+		idx := 0
+		runAndMeasure(b, func() {
+			_ = c.engine.Search(c.multiExact[idx%queryPoolSize], nil)
+			idx++
+		})
+	})
+
+	b.Run(fmt.Sprintf("MultiTerm/Filter/%s", label), func(b *testing.B) {
+		b.ReportAllocs()
+		b.ReportMetric(c.heapMB, "heap_MB")
+		idx := 0
+		runAndMeasure(b, func() {
+			_ = c.engine.Search(c.multiExact[idx%queryPoolSize], c.yearFilters[idx%queryPoolSize])
+			idx++
+		})
+	})
 }

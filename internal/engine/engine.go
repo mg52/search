@@ -5,13 +5,11 @@
 package engine
 
 import (
-	"container/heap"
 	"encoding/gob"
 	"fmt"
 	"os"
 	"regexp"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,27 +19,97 @@ import (
 	"github.com/mg52/search/internal/pkg/trie"
 )
 
-type minHeap []internalHit
-
-func (h minHeap) Len() int           { return len(h) }
-func (h minHeap) Less(i, j int) bool { return h[i].score < h[j].score } // min-heap
-func (h minHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-
-func (h *minHeap) Push(x any) {
-	*h = append(*h, x.(internalHit))
-}
-
-func (h *minHeap) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[:n-1]
-	return x
-}
-
 type internalHit struct {
 	id    uint32
 	score int
+}
+
+// Specialized min-heap over []internalHit. Inlined sift operations avoid the
+// interface dispatch and any-boxing overhead of container/heap, which matters
+// in the per-document inner loops of search.
+
+// heapPushHit appends hit and sifts it up. Returns the new slice header.
+func heapPushHit(h []internalHit, hit internalHit) []internalHit {
+	h = append(h, hit)
+	i := len(h) - 1
+	for i > 0 {
+		parent := (i - 1) >> 1
+		if h[parent].score <= h[i].score {
+			break
+		}
+		h[parent], h[i] = h[i], h[parent]
+		i = parent
+	}
+	return h
+}
+
+// heapReplaceTop overwrites the root and sifts it down — one operation
+// instead of pop+push when the heap is already at capacity. len(h) > 0.
+func heapReplaceTop(h []internalHit, hit internalHit) {
+	h[0] = hit
+	siftDownHit(h, 0, len(h))
+}
+
+func siftDownHit(h []internalHit, start, n int) {
+	i := start
+	for {
+		left := 2*i + 1
+		if left >= n {
+			return
+		}
+		smallest := left
+		if right := left + 1; right < n && h[right].score < h[left].score {
+			smallest = right
+		}
+		if h[i].score <= h[smallest].score {
+			return
+		}
+		h[i], h[smallest] = h[smallest], h[i]
+		i = smallest
+	}
+}
+
+// ---- filter bitset helpers ----
+// Bitsets are indexed by internalDocID: word = id>>6, bit = id&63.
+// filterBitSet grows bits as needed and sets the bit for id.
+func filterBitSet(bits []uint64, id uint32) []uint64 {
+	word := id >> 6
+	for uint32(len(bits)) <= word {
+		bits = append(bits, 0)
+	}
+	bits[word] |= 1 << (id & 63)
+	return bits
+}
+
+func filterBitTest(bits []uint64, id uint32) bool {
+	word := id >> 6
+	return uint32(len(bits)) > word && bits[word]&(1<<(id&63)) != 0
+}
+
+// filterBitOr returns a new bitset that is the union of a and b.
+func filterBitOr(a, b []uint64) []uint64 {
+	if len(b) > len(a) {
+		a, b = b, a
+	}
+	out := make([]uint64, len(a))
+	copy(out, a)
+	for i := range b {
+		out[i] |= b[i]
+	}
+	return out
+}
+
+// filterBitAnd returns a new bitset that is the intersection of a and b.
+func filterBitAnd(a, b []uint64) []uint64 {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	out := make([]uint64, n)
+	for i := range out {
+		out[i] = a[i] & b[i]
+	}
+	return out
 }
 
 // TODO: make it a variable
@@ -97,7 +165,7 @@ type SearchEngine struct {
 
 	// Docs + filters
 	Documents   map[uint32]map[string]interface{} // internalDocID -> doc fields
-	FilterDocs  map[string]map[uint32]bool        // "field:value" -> set(internalDocID)
+	FilterBits  map[string][]uint64               // "field:value" -> bitset of internalDocIDs
 	Keys        *keys.Keys
 	Trie        *trie.Trie
 	Prefix      map[string][]string
@@ -124,7 +192,7 @@ func NewSearchEngine(indexFields []string, filters map[string]bool, resultSize i
 		Trie:               trie.NewTrie(),
 		Prefix:             make(map[string][]string),
 		Symspell:           symspell.NewSymSpell(),
-		FilterDocs:         make(map[string]map[uint32]bool),
+		FilterBits:         make(map[string][]uint64),
 		ResultSize:         resultSize,
 	}
 }
@@ -196,7 +264,7 @@ func LoadAll(path string) (*SearchEngine, error) {
 		InternalToExternal: make(map[uint32]string),
 		nextInternalID:     1,
 		Documents:          make(map[uint32]map[string]interface{}),
-		FilterDocs:         make(map[string]map[uint32]bool),
+		FilterBits:         make(map[string][]uint64),
 		Keys:               keys.NewKeys(),
 		Trie:               trie.NewTrie(),
 		Prefix:             make(map[string][]string),
@@ -285,32 +353,26 @@ func LoadAll(path string) (*SearchEngine, error) {
 			se.addToDocumentIndex(token, internalID, len(allTokens))
 		}
 
-		// 3) Rebuild filter docs
+		// 3) Rebuild filter bitsets
 		for field := range se.Filters {
 			val, ok := doc[field]
 			if !ok {
 				continue
 			}
 
-			switch v := val.(type) {
+			var filterKey string
+			switch val.(type) {
 			case int, int8, int16, int32, int64, float32, float64:
-				filterKey := fmt.Sprintf("%s:%v", field, v)
-				se.mu.Lock()
-				if se.FilterDocs[filterKey] == nil {
-					se.FilterDocs[filterKey] = make(map[uint32]bool)
-				}
-				se.FilterDocs[filterKey][internalID] = true
-				se.mu.Unlock()
-
+				filterKey = fmt.Sprintf("%s:%v", field, val)
 			case string:
-				filterKey := fmt.Sprintf("%s:%s", field, v)
-				se.mu.Lock()
-				if se.FilterDocs[filterKey] == nil {
-					se.FilterDocs[filterKey] = make(map[uint32]bool)
-				}
-				se.FilterDocs[filterKey][internalID] = true
-				se.mu.Unlock()
+				filterKey = fmt.Sprintf("%s:%s", field, val)
+			default:
+				continue
 			}
+
+			se.mu.Lock()
+			se.FilterBits[filterKey] = filterBitSet(se.FilterBits[filterKey], internalID)
+			se.mu.Unlock()
 		}
 	}
 
@@ -452,26 +514,24 @@ func (se *SearchEngine) BuildDocumentIndex(docs []map[string]interface{}) {
 
 			// ---- filters ----
 			for field := range filters {
-				if value, exists := doc[field]; exists {
-					switch v := value.(type) {
-					case int, int8, int16, int32, int64, float32, float64:
-						filterKey := fmt.Sprintf("%s:%v", field, v)
-						se.mu.Lock()
-						if se.FilterDocs[filterKey] == nil {
-							se.FilterDocs[filterKey] = make(map[uint32]bool)
-						}
-						se.FilterDocs[filterKey][internal] = true
-						se.mu.Unlock()
-					case string:
-						filterKey := fmt.Sprintf("%s:%s", field, v)
-						se.mu.Lock()
-						if se.FilterDocs[filterKey] == nil {
-							se.FilterDocs[filterKey] = make(map[uint32]bool)
-						}
-						se.FilterDocs[filterKey][internal] = true
-						se.mu.Unlock()
-					}
+				value, exists := doc[field]
+				if !exists {
+					continue
 				}
+
+				var filterKey string
+				switch value.(type) {
+				case int, int8, int16, int32, int64, float32, float64:
+					filterKey = fmt.Sprintf("%s:%v", field, value)
+				case string:
+					filterKey = fmt.Sprintf("%s:%s", field, value)
+				default:
+					continue
+				}
+
+				se.mu.Lock()
+				se.FilterBits[filterKey] = filterBitSet(se.FilterBits[filterKey], internal)
+				se.mu.Unlock()
 			}
 		}
 	}
@@ -534,56 +594,24 @@ func (se *SearchEngine) addToDocumentIndex(term string, internalDocID uint32, le
 
 // -------------------- Search --------------------
 
-// func (se *SearchEngine) SearchOneTermWithoutFilter(query string) []ReturnedDocument {
-// 	se.mu.RLock()
-// 	defer se.mu.RUnlock()
-
-// 	postingsByDoc := se.DataMap[query]
-// 	if postingsByDoc == nil {
-// 		return nil
-// 	}
-
-// 	hits := make([]internalHit, 0)
-
-// 	for internalID, score := range postingsByDoc {
-// 		if se.DocDeleted[internalID] {
-// 			continue
-// 		}
-
-// 		hits = append(hits, internalHit{id: internalID, score: score})
-// 	}
-
-// 	if len(hits) == 0 {
-// 		return nil
-// 	}
-
-// 	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
-
-// 	end := se.ResultSize
-// 	if end > len(hits) {
-// 		end = len(hits)
-// 	}
-
-// 	out := make([]ReturnedDocument, 0, end)
-// 	for _, hit := range hits[0:end] {
-// 		extID := se.InternalToExternal[hit.id]
-// 		out = append(out, ReturnedDocument{
-// 			ID:    extID,
-// 			Data:  se.Documents[hit.id],
-// 			Score: hit.score,
-// 		})
-// 	}
-// 	return out
-// }
-
-// SearchOneTermWithoutFilter retrieves results for a single term.
-// Search holds RLock for the whole function to avoid concurrent map read/write panics.
-func (se *SearchEngine) SearchOneTermWithoutFilter(query string) []ReturnedDocument {
+// SearchOneTerm returns the top-k matching documents for a single term, ranked
+// by score descending. If filters is non-empty, only documents passing the
+// filter are considered. The whole function holds RLock to avoid concurrent
+// map read/write panics with index updates.
+func (se *SearchEngine) SearchOneTerm(query string, filters map[string][]interface{}) []ReturnedDocument {
 	se.mu.RLock()
 	defer se.mu.RUnlock()
 
+	var allowed []uint64
+	if len(filters) > 0 {
+		allowed = se.applyFilterLocked(filters)
+		if allowed == nil {
+			return nil
+		}
+	}
+
 	postings := se.DataMap[query]
-	if postings == nil {
+	if len(postings) == 0 {
 		return nil
 	}
 
@@ -592,101 +620,55 @@ func (se *SearchEngine) SearchOneTermWithoutFilter(query string) []ReturnedDocum
 		return nil
 	}
 
-	h := &minHeap{}
-	heap.Init(h)
+	deleted := se.DocDeleted
+	h := make([]internalHit, 0, k)
 
 	for id, score := range postings {
-		if se.DocDeleted[id] {
+		if deleted[id] {
+			continue
+		}
+		if allowed != nil && !filterBitTest(allowed, id) {
 			continue
 		}
 
-		if h.Len() < k {
-			heap.Push(h, internalHit{id: id, score: score})
-		} else if (*h)[0].score < score {
-			heap.Pop(h)
-			heap.Push(h, internalHit{id: id, score: score})
+		if len(h) < k {
+			h = heapPushHit(h, internalHit{id: id, score: score})
+		} else if h[0].score < score {
+			heapReplaceTop(h, internalHit{id: id, score: score})
 		}
 	}
 
-	if h.Len() == 0 {
+	n := len(h)
+	if n == 0 {
 		return nil
 	}
 
-	// extract results (reverse to highest-first)
-	n := h.Len()
+	// Extract in descending order via repeated heap-pop. Each pop yields the
+	// minimum, so we fill out[n-1], out[n-2], ... out[0]. Pop is inlined: swap
+	// root with last, sift down over the shrinking prefix.
+	extMap := se.InternalToExternal
+	docs := se.Documents
 	out := make([]ReturnedDocument, n)
-
 	for i := n - 1; i >= 0; i-- {
-		hit := heap.Pop(h).(internalHit)
-		extID := se.InternalToExternal[hit.id]
-
+		hit := h[0]
+		if i > 0 {
+			h[0] = h[i]
+			siftDownHit(h, 0, i)
+		}
 		out[i] = ReturnedDocument{
-			ID:    extID,
-			Data:  se.Documents[hit.id],
+			ID:    extMap[hit.id],
+			Data:  docs[hit.id],
 			Score: hit.score,
 		}
-	}
-
-	return out
-}
-
-// SearchOneTermWithFilter retrieves results for a single term, applying filters.
-// If filters is nil/empty, it falls back to SearchOneTermWithoutFilter.
-func (se *SearchEngine) SearchOneTermWithFilter(query string, filters map[string][]interface{}) []ReturnedDocument {
-	if len(filters) == 0 {
-		return se.SearchOneTermWithoutFilter(query)
-	}
-
-	allowed := se.ApplyFilter(filters)
-	if len(allowed) == 0 {
-		return nil
-	}
-
-	se.mu.RLock()
-	defer se.mu.RUnlock()
-
-	postingsByDoc := se.DataMap[query]
-	if postingsByDoc == nil {
-		return nil
-	}
-
-	hits := make([]internalHit, 0)
-
-	for internalID, score := range postingsByDoc {
-		if se.DocDeleted[internalID] {
-			continue
-		}
-		if !allowed[internalID] {
-			continue
-		}
-		hits = append(hits, internalHit{id: internalID, score: score})
-	}
-
-	if len(hits) == 0 {
-		return nil
-	}
-
-	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
-
-	end := se.ResultSize
-	if end > len(hits) {
-		end = len(hits)
-	}
-
-	out := make([]ReturnedDocument, 0, end)
-	for _, hit := range hits[0:end] {
-		out = append(out, ReturnedDocument{
-			ID:    se.InternalToExternal[hit.id],
-			Data:  se.Documents[hit.id],
-			Score: hit.score,
-		})
 	}
 	return out
 }
 
-// SearchMultipleTermsWithoutFilter executes AND across groups and OR within group.
-// Search holds RLock for the whole function to avoid concurrent map read/write panics.
-func (se *SearchEngine) SearchMultipleTermsWithoutFilter(termArrList [][]string) []ReturnedDocument {
+// SearchMultiTerms returns the top-k matching documents for a multi-term query
+// expressed as groups of synonyms. Semantics: AND across groups, OR within a
+// group. If filters is non-empty, only documents passing the filter are
+// considered. RLock is held for the whole function.
+func (se *SearchEngine) SearchMultiTerms(termArrList [][]string, filters map[string][]interface{}) []ReturnedDocument {
 	if len(termArrList) == 0 {
 		return nil
 	}
@@ -694,6 +676,20 @@ func (se *SearchEngine) SearchMultipleTermsWithoutFilter(termArrList [][]string)
 	se.mu.RLock()
 	defer se.mu.RUnlock()
 
+	var allowed []uint64
+	if len(filters) > 0 {
+		allowed = se.applyFilterLocked(filters)
+		if allowed == nil {
+			return nil
+		}
+	}
+
+	k := se.ResultSize
+	if k <= 0 {
+		return nil
+	}
+
+	dataMap := se.DataMap
 	groups := make([][]map[uint32]int, len(termArrList))
 	groupSizes := make([]int, len(termArrList))
 
@@ -706,7 +702,7 @@ func (se *SearchEngine) SearchMultipleTermsWithoutFilter(termArrList [][]string)
 		sizeSum := 0
 
 		for _, term := range terms {
-			if m := se.DataMap[term]; m != nil {
+			if m := dataMap[term]; m != nil {
 				group = append(group, m)
 				sizeSum += len(m)
 			}
@@ -720,7 +716,7 @@ func (se *SearchEngine) SearchMultipleTermsWithoutFilter(termArrList [][]string)
 		groupSizes[i] = sizeSum
 	}
 
-	// Choose anchor group (most selective by rough size estimate)
+	// Anchor on the smallest group — fewest candidates to enumerate.
 	anchorIdx := 0
 	anchorSize := groupSizes[0]
 	for i := 1; i < len(groupSizes); i++ {
@@ -731,25 +727,35 @@ func (se *SearchEngine) SearchMultipleTermsWithoutFilter(termArrList [][]string)
 	}
 	anchorGroup := groups[anchorIdx]
 
-	visited := make(map[uint32]struct{}, anchorSize)
+	// Dedup is only needed when the anchor group has multiple posting maps
+	// (synonyms can overlap on the same docID). One map = no overlap possible.
+	var visited map[uint32]struct{}
+	if len(anchorGroup) > 1 {
+		visited = make(map[uint32]struct{}, anchorSize)
+	}
 
-	hits := make([]internalHit, 0)
+	deleted := se.DocDeleted
+	h := make([]internalHit, 0, k)
 
 	for _, anchorMap := range anchorGroup {
 		for internalID, score := range anchorMap {
-			if _, seen := visited[internalID]; seen {
+			if visited != nil {
+				if _, seen := visited[internalID]; seen {
+					continue
+				}
+				visited[internalID] = struct{}{}
+			}
+
+			if deleted[internalID] {
 				continue
 			}
-			visited[internalID] = struct{}{}
-
-			if se.DocDeleted[internalID] {
+			if allowed != nil && !filterBitTest(allowed, internalID) {
 				continue
 			}
 
 			total := score
 			valid := true
 
-			// AND across groups, OR within group
 			for gi, group := range groups {
 				if gi == anchorIdx {
 					continue
@@ -774,198 +780,144 @@ func (se *SearchEngine) SearchMultipleTermsWithoutFilter(termArrList [][]string)
 				continue
 			}
 
-			hits = append(hits, internalHit{id: internalID, score: total})
+			if len(h) < k {
+				h = heapPushHit(h, internalHit{id: internalID, score: total})
+			} else if h[0].score < total {
+				heapReplaceTop(h, internalHit{id: internalID, score: total})
+			}
 		}
 	}
-	if len(hits) == 0 {
+
+	n := len(h)
+	if n == 0 {
 		return nil
 	}
 
-	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
-
-	end := se.ResultSize
-	if end > len(hits) {
-		end = len(hits)
-	}
-
-	out := make([]ReturnedDocument, 0, end)
-	for _, hit := range hits[0:end] {
-		out = append(out, ReturnedDocument{
-			ID:    se.InternalToExternal[hit.id],
-			Data:  se.Documents[hit.id],
+	extMap := se.InternalToExternal
+	docs := se.Documents
+	out := make([]ReturnedDocument, n)
+	for i := n - 1; i >= 0; i-- {
+		hit := h[0]
+		if i > 0 {
+			h[0] = h[i]
+			siftDownHit(h, 0, i)
+		}
+		out[i] = ReturnedDocument{
+			ID:    extMap[hit.id],
+			Data:  docs[hit.id],
 			Score: hit.score,
-		})
+		}
 	}
 	return out
 }
 
-// SearchMultiTermsWithFilter executes AND across groups and OR within group, applying filters.
-// If filters is nil/empty, it falls back to SearchMultipleTermsWithoutFilter.
-func (se *SearchEngine) SearchMultiTermsWithFilter(termArrList [][]string, filters map[string][]interface{}) []ReturnedDocument {
-	if len(filters) == 0 {
-		return se.SearchMultipleTermsWithoutFilter(termArrList)
-	}
-
-	allowed := se.ApplyFilter(filters)
-	if len(allowed) == 0 {
-		return nil
-	}
-
-	if len(termArrList) == 0 {
-		return nil
-	}
-
-	se.mu.RLock()
-	defer se.mu.RUnlock()
-
-	groups := make([][]map[uint32]int, len(termArrList))
-	groupSizes := make([]int, len(termArrList))
-
-	for i, terms := range termArrList {
-		if len(terms) == 0 {
-			return nil
-		}
-
-		group := make([]map[uint32]int, 0, len(terms))
-		sizeSum := 0
-
-		for _, term := range terms {
-			if m := se.DataMap[term]; m != nil {
-				group = append(group, m)
-				sizeSum += len(m)
-			}
-		}
-
-		if len(group) == 0 {
-			return nil
-		}
-
-		groups[i] = group
-		groupSizes[i] = sizeSum
-	}
-
-	// Choose anchor group (most selective by rough size estimate)
-	anchorIdx := 0
-	anchorSize := groupSizes[0]
-	for i := 1; i < len(groupSizes); i++ {
-		if groupSizes[i] < anchorSize {
-			anchorSize = groupSizes[i]
-			anchorIdx = i
-		}
-	}
-	anchorGroup := groups[anchorIdx]
-
-	visited := make(map[uint32]struct{}, anchorSize)
-	hits := make([]internalHit, 0)
-
-	for _, anchorMap := range anchorGroup {
-		for internalID, score := range anchorMap {
-			if _, seen := visited[internalID]; seen {
-				continue
-			}
-			visited[internalID] = struct{}{}
-
-			if !allowed[internalID] {
-				continue
-			}
-			if se.DocDeleted[internalID] {
-				continue
-			}
-
-			total := score
-			valid := true
-
-			// AND across groups, OR within group
-			for gi, group := range groups {
-				if gi == anchorIdx {
-					continue
-				}
-
-				found := false
-				for _, m := range group {
-					if s, ok := m[internalID]; ok {
-						total += s
-						found = true
-						break
-					}
-				}
-
-				if !found {
-					valid = false
-					break
-				}
-			}
-
-			if !valid {
-				continue
-			}
-
-			hits = append(hits, internalHit{id: internalID, score: total})
-		}
-	}
-
-	if len(hits) == 0 {
-		return nil
-	}
-
-	sort.Slice(hits, func(i, j int) bool { return hits[i].score > hits[j].score })
-
-	end := se.ResultSize
-	if end > len(hits) {
-		end = len(hits)
-	}
-
-	out := make([]ReturnedDocument, 0, end)
-	for _, hit := range hits[0:end] {
-		out = append(out, ReturnedDocument{
-			ID:    se.InternalToExternal[hit.id],
-			Data:  se.Documents[hit.id],
-			Score: hit.score,
-		})
-	}
-	return out
-}
-
-// ApplyFilter returns the set of internal docIDs that satisfy the given filters.
-// Semantics: OR within a field's values, AND across different fields.
-func (se *SearchEngine) ApplyFilter(filters map[string][]interface{}) map[uint32]bool {
-	if len(filters) == 0 {
-		return nil
-	}
-
-	se.mu.RLock()
-	defer se.mu.RUnlock()
-
-	var result map[uint32]bool
-	firstField := true
+// applyFilterLocked resolves filters to a bitset without acquiring any lock.
+// Caller must hold se.mu.RLock for the entire time the returned slice is used.
+//
+// Fast path (single field, single value): returns a direct reference into
+// se.FilterBits — zero allocation. Multi-value OR and multi-field AND still
+// allocate intermediate bitsets, but those cases are uncommon.
+func (se *SearchEngine) applyFilterLocked(filters map[string][]interface{}) []uint64 {
+	var result []uint64
+	first := true
 
 	for field, values := range filters {
-		fieldUnion := make(map[uint32]bool)
-		for _, v := range values {
-			key := fmt.Sprintf("%s:%v", field, v)
-			docs := se.FilterDocs[key]
-			for internalID := range docs {
-				if se.DocDeleted[internalID] {
+		var fieldBits []uint64
+
+		if len(values) == 1 {
+			// Fast path: direct reference, no copy.
+			key := fmt.Sprintf("%s:%v", field, values[0])
+			fieldBits = se.FilterBits[key]
+		} else {
+			// Multi-value OR: must build a union (allocates once).
+			for _, v := range values {
+				key := fmt.Sprintf("%s:%v", field, v)
+				bits := se.FilterBits[key]
+				if len(bits) == 0 {
 					continue
 				}
-				fieldUnion[internalID] = true
+				if fieldBits == nil {
+					fieldBits = append([]uint64(nil), bits...)
+				} else {
+					fieldBits = filterBitOr(fieldBits, bits)
+				}
 			}
 		}
 
-		if firstField {
+		if len(fieldBits) == 0 {
+			return nil
+		}
+
+		if first {
+			result = fieldBits
+			first = false
+		} else {
+			result = filterBitAnd(result, fieldBits)
+			hasAny := false
+			for _, w := range result {
+				if w != 0 {
+					hasAny = true
+					break
+				}
+			}
+			if !hasAny {
+				return nil
+			}
+		}
+	}
+
+	return result
+}
+
+// ApplyFilter returns a bitset of internal docIDs that satisfy the given filters.
+// Semantics: OR within a field's values, AND across different fields.
+// Returns nil when filters produce no matches (or filters map is empty).
+// For internal search paths use applyFilterLocked to avoid the copy.
+func (se *SearchEngine) ApplyFilter(filters map[string][]interface{}) []uint64 {
+	if len(filters) == 0 {
+		return nil
+	}
+
+	se.mu.RLock()
+	defer se.mu.RUnlock()
+
+	var result []uint64
+	first := true
+
+	for field, values := range filters {
+		var fieldUnion []uint64
+		for _, v := range values {
+			key := fmt.Sprintf("%s:%v", field, v)
+			bits := se.FilterBits[key]
+			if len(bits) == 0 {
+				continue
+			}
+			if fieldUnion == nil {
+				fieldUnion = append([]uint64(nil), bits...)
+			} else {
+				fieldUnion = filterBitOr(fieldUnion, bits)
+			}
+		}
+
+		if fieldUnion == nil {
+			return nil
+		}
+
+		if first {
 			result = fieldUnion
-			firstField = false
-			continue
-		}
-
-		for internalID := range result {
-			if !fieldUnion[internalID] {
-				delete(result, internalID)
+			first = false
+		} else {
+			result = filterBitAnd(result, fieldUnion)
+			hasAny := false
+			for _, w := range result {
+				if w != 0 {
+					hasAny = true
+					break
+				}
 			}
-		}
-
-		if len(result) == 0 {
-			break
+			if !hasAny {
+				return nil
+			}
 		}
 	}
 
@@ -985,7 +937,6 @@ func (se *SearchEngine) Search(query string, filters map[string][]interface{}) *
 }
 
 // SingleTermSearch resolves a single-token query via prefix (preferred) or fuzzy expansions.
-// Filter behavior preserved: your original SingleTermSearch ignored filters in else-block.
 func (se *SearchEngine) SingleTermSearch(queryTokens []string, filters map[string][]interface{}) *SearchResult {
 	parsedQuery := make(map[string][]string)
 	maxPrefixTokens := 3
@@ -1011,19 +962,11 @@ func (se *SearchEngine) SingleTermSearch(queryTokens []string, filters map[strin
 
 	var finalDocs []ReturnedDocument
 	if exists := se.Keys.Exists(queryTokens[0]); exists {
-		if len(filters) > 0 {
-			finalDocs = append(finalDocs, se.SearchOneTermWithFilter(queryTokens[0], filters)...)
-		} else {
-			finalDocs = append(finalDocs, se.SearchOneTermWithoutFilter(queryTokens[0])...)
-		}
+		finalDocs = append(finalDocs, se.SearchOneTerm(queryTokens[0], filters)...)
 	}
 	if parsedQuery["prefix"] != nil {
 		for _, q := range parsedQuery["prefix"] {
-			if len(filters) > 0 {
-				finalDocs = append(finalDocs, se.SearchOneTermWithFilter(q, filters)...)
-			} else {
-				finalDocs = append(finalDocs, se.SearchOneTermWithoutFilter(q)...)
-			}
+			finalDocs = append(finalDocs, se.SearchOneTerm(q, filters)...)
 		}
 		limit := se.ResultSize
 		if len(finalDocs) < limit {
@@ -1033,11 +976,7 @@ func (se *SearchEngine) SingleTermSearch(queryTokens []string, filters map[strin
 	}
 	if parsedQuery["fuzzy"] != nil {
 		for _, q := range parsedQuery["fuzzy"] {
-			if len(filters) > 0 {
-				finalDocs = append(finalDocs, se.SearchOneTermWithFilter(q, filters)...)
-			} else {
-				finalDocs = append(finalDocs, se.SearchOneTermWithoutFilter(q)...)
-			}
+			finalDocs = append(finalDocs, se.SearchOneTerm(q, filters)...)
 		}
 		limit := se.ResultSize
 		if len(finalDocs) < limit {
@@ -1054,9 +993,7 @@ func (se *SearchEngine) SingleTermSearch(queryTokens []string, filters map[strin
 }
 
 // MultiTermSearch executes a multi-token query using grouped boolean search strategies.
-// Filter behavior preserved (original multi-term path did not apply filters).
-// First terms: Exact match + fuzzy(10)
-// Last term: Exact match + prefix(40)
+// First terms: exact match + fuzzy(10). Last term: exact match + prefix(40).
 func (se *SearchEngine) MultiTermSearch(queryTokens []string, filters map[string][]interface{}) *SearchResult {
 	lastQueryIndex := len(queryTokens) - 1
 	rawFirstTerms := queryTokens[:lastQueryIndex]
@@ -1086,14 +1023,7 @@ func (se *SearchEngine) MultiTermSearch(queryTokens []string, filters map[string
 
 	termArrList[lastQueryIndex] = append(termArrList[lastQueryIndex], lastTermGuessArr...)
 
-	var returnedDocuments []ReturnedDocument
-	if len(filters) > 0 {
-		returnedDocuments = se.SearchMultiTermsWithFilter(termArrList, filters)
-	} else {
-		returnedDocuments = se.SearchMultipleTermsWithoutFilter(termArrList)
-	}
-
-	return &SearchResult{Docs: returnedDocuments}
+	return &SearchResult{Docs: se.SearchMultiTerms(termArrList, filters)}
 }
 
 // AddOrUpdateDocument inserts or updates a single document.
@@ -1173,33 +1103,26 @@ func (se *SearchEngine) AddOrUpdateDocument(doc map[string]interface{}) error {
 		se.addToDocumentIndex(token, internal, len(allTokens))
 	}
 
-	// 5) Update filters (write-lock per key, consistent with batch version)
-	//    NOTE: We do not remove old internal IDs from filter sets (tombstone model).
+	// 5) Update filter bitsets (tombstone model: old internal IDs are never cleared).
 	for field := range filters {
 		value, exists := doc[field]
 		if !exists {
 			continue
 		}
 
-		switch v := value.(type) {
+		var filterKey string
+		switch value.(type) {
 		case int, int8, int16, int32, int64, float32, float64:
-			filterKey := fmt.Sprintf("%s:%v", field, v)
-			se.mu.Lock()
-			if se.FilterDocs[filterKey] == nil {
-				se.FilterDocs[filterKey] = make(map[uint32]bool)
-			}
-			se.FilterDocs[filterKey][internal] = true
-			se.mu.Unlock()
-
+			filterKey = fmt.Sprintf("%s:%v", field, value)
 		case string:
-			filterKey := fmt.Sprintf("%s:%s", field, v)
-			se.mu.Lock()
-			if se.FilterDocs[filterKey] == nil {
-				se.FilterDocs[filterKey] = make(map[uint32]bool)
-			}
-			se.FilterDocs[filterKey][internal] = true
-			se.mu.Unlock()
+			filterKey = fmt.Sprintf("%s:%s", field, value)
+		default:
+			continue
 		}
+
+		se.mu.Lock()
+		se.FilterBits[filterKey] = filterBitSet(se.FilterBits[filterKey], internal)
+		se.mu.Unlock()
 	}
 
 	return nil

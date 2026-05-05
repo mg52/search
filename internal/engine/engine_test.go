@@ -1,10 +1,8 @@
 package engine
 
 import (
-	"container/heap"
 	"os"
 	"path/filepath"
-	"reflect"
 	"sort"
 	"sync"
 	"testing"
@@ -12,26 +10,29 @@ import (
 	_ "embed"
 )
 
-// helper to build a SearchEngine with prepopulated FilterDocs
-func newTestEngineWithData(data map[string]map[uint32]bool) *SearchEngine {
+// helper to build a SearchEngine with prepopulated FilterBits
+func newTestEngineWithData(data map[string][]uint64) *SearchEngine {
 	return &SearchEngine{
 		mu:         sync.RWMutex{},
-		FilterDocs: data,
+		FilterBits: data,
 		DocDeleted: make(map[uint32]bool),
 		ResultSize: 100,
 	}
 }
 
 func TestApplyFilter_SingleValue(t *testing.T) {
-	se := newTestEngineWithData(map[string]map[uint32]bool{
-		"author:Alice": {1: true, 2: true},
-	})
+	bits := make(map[string][]uint64)
+	bits["author:Alice"] = filterBitSet(bits["author:Alice"], 1)
+	bits["author:Alice"] = filterBitSet(bits["author:Alice"], 2)
+	se := newTestEngineWithData(bits)
 
 	filters := map[string][]interface{}{"author": {"Alice"}}
 	got := se.ApplyFilter(filters)
-	exp := map[uint32]bool{1: true, 2: true}
-	if !reflect.DeepEqual(got, exp) {
-		t.Errorf("Expected %v, got %v", exp, got)
+	if got == nil {
+		t.Fatal("expected non-nil bitset")
+	}
+	if !filterBitTest(got, 1) || !filterBitTest(got, 2) {
+		t.Errorf("expected ids 1 and 2 to be set in bitset, got %v", got)
 	}
 }
 
@@ -126,7 +127,7 @@ func newTestEngineForMultiTerm() *SearchEngine {
 func TestSearchOneTermBasic(t *testing.T) {
 	se := newTestEngine()
 
-	res := se.SearchOneTermWithoutFilter("apple")
+	res := se.SearchOneTerm("apple", nil)
 	if len(res) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(res))
 	}
@@ -139,7 +140,7 @@ func TestSearchOneTermBasic(t *testing.T) {
 func TestSearchOneTermDeleted(t *testing.T) {
 	se := newTestEngine()
 
-	res := se.SearchOneTermWithoutFilter("phone")
+	res := se.SearchOneTerm("phone", nil)
 	if len(res) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(res))
 	}
@@ -157,7 +158,7 @@ func TestSearchMultiTermAND_OR(t *testing.T) {
 		{"iphone", "phone", "phona"},
 	}
 
-	res := se.SearchMultipleTermsWithoutFilter(terms)
+	res := se.SearchMultiTerms(terms, nil)
 	if len(res) != 2 {
 		t.Fatalf("expected 2 result, got %d, res=%+v", len(res), res)
 	}
@@ -179,7 +180,7 @@ func TestSearchMultiTermScoreAggregation(t *testing.T) {
 		{"iphone"},
 	}
 
-	res := se.SearchMultipleTermsWithoutFilter(terms)
+	res := se.SearchMultiTerms(terms, nil)
 	if len(res) != 2 {
 		t.Fatalf("expected 2 result, got %d, res=%+v", len(res), res)
 	}
@@ -196,7 +197,7 @@ func TestSearchMultiTermScoreAggregation(t *testing.T) {
 func TestSearchMultiTermEmpty(t *testing.T) {
 	se := newTestEngine()
 
-	res := se.SearchMultipleTermsWithoutFilter([][]string{{"nonexistent"}})
+	res := se.SearchMultiTerms([][]string{{"nonexistent"}}, nil)
 	if res != nil {
 		t.Fatalf("expected nil result")
 	}
@@ -270,9 +271,9 @@ func TestAddOrUpdateAndDelete_E2E(t *testing.T) {
 	}
 
 	// 2) Exact-term searches should find what we indexed
-	assertIDs(t, se.SearchOneTermWithoutFilter("sunny"), "1")
-	assertIDs(t, se.SearchOneTermWithoutFilter("rio"), "1", "2")
-	assertIDs(t, se.SearchOneTermWithoutFilter("cloudy"), "3")
+	assertIDs(t, se.SearchOneTerm("sunny", nil), "1")
+	assertIDs(t, se.SearchOneTerm("rio", nil), "1", "2")
+	assertIDs(t, se.SearchOneTerm("cloudy", nil), "3")
 
 	// 3) Update doc2: remove "rio", add "sunny"
 	// Old internal version should become tombstoned, new version indexed.
@@ -286,19 +287,19 @@ func TestAddOrUpdateAndDelete_E2E(t *testing.T) {
 	}
 
 	// Now "rio" should no longer include doc2 (old internal is deleted)
-	assertIDs(t, se.SearchOneTermWithoutFilter("rio"), "1")
+	assertIDs(t, se.SearchOneTerm("rio", nil), "1")
 
 	// "sunny" should include doc1 and updated doc2
 	// (order not guaranteed, we compare as a set)
-	assertIDs(t, se.SearchOneTermWithoutFilter("sunny"), "1", "2")
+	assertIDs(t, se.SearchOneTerm("sunny", nil), "1", "2")
 
 	// 4) Delete doc1 and verify it disappears from results
 	if ok := se.DeleteDocument("1"); !ok {
 		t.Fatalf("DeleteDocument(1) expected true")
 	}
 
-	assertIDs(t, se.SearchOneTermWithoutFilter("sunny"), "2")
-	assertIDs(t, se.SearchOneTermWithoutFilter("rio")) // empty
+	assertIDs(t, se.SearchOneTerm("sunny", nil), "2")
+	assertIDs(t, se.SearchOneTerm("rio", nil)) // empty
 
 	// Deleting an unknown external ID should return false
 	if ok := se.DeleteDocument("does-not-exist"); ok {
@@ -315,8 +316,8 @@ func TestAddOrUpdateAndDelete_E2E(t *testing.T) {
 		t.Fatalf("AddOrUpdateDocument doc4: %v", err)
 	}
 
-	assertIDs(t, se.SearchOneTermWithoutFilter("rio"), "4")
-	assertIDs(t, se.SearchOneTermWithoutFilter("sunny"), "2", "4")
+	assertIDs(t, se.SearchOneTerm("rio", nil), "4")
+	assertIDs(t, se.SearchOneTerm("sunny", nil), "2", "4")
 
 	// 6) E2E via Search() as well (single term path)
 	// (Uses prefix/fuzzy expansion internally, but for these exact terms it should include the same docs.)
@@ -335,12 +336,10 @@ func TestAddOrUpdateAndDelete_E2E(t *testing.T) {
 	if res == nil {
 		t.Fatalf("Search (filtered) returned nil")
 	}
-	// If your Search() wiring applies filters, this should pass.
-	// If you haven't wired filters into Search() yet, use SearchOneTermWithFilter below.
 	assertIDs(t, res.Docs, "2")
 
 	// Extra safety: leaf filtered function should always work if present.
-	assertIDs(t, se.SearchOneTermWithFilter("sunny", filters), "2")
+	assertIDs(t, se.SearchOneTerm("sunny", filters), "2")
 }
 
 func containsString(arr []string, s string) bool {
@@ -391,8 +390,8 @@ func TestSaveLoad_RebuildsIndexesFromDocuments(t *testing.T) {
 	}
 
 	// Sanity before save
-	assertIDs(t, se.SearchOneTermWithoutFilter("sunny"), "2")
-	assertIDs(t, se.SearchOneTermWithoutFilter("rio")) // should be empty now
+	assertIDs(t, se.SearchOneTerm("sunny", nil), "2")
+	assertIDs(t, se.SearchOneTerm("rio", nil)) // should be empty now
 
 	// 2) Save to temp dir
 	dir := t.TempDir()
@@ -425,21 +424,29 @@ func TestSaveLoad_RebuildsIndexesFromDocuments(t *testing.T) {
 	}
 
 	// Searches work (meaning DataMap rebuilt and tombstones respected)
-	assertIDs(t, loaded.SearchOneTermWithoutFilter("sunny"), "2")
-	assertIDs(t, loaded.SearchOneTermWithoutFilter("rio")) // empty
+	assertIDs(t, loaded.SearchOneTerm("sunny", nil), "2")
+	assertIDs(t, loaded.SearchOneTerm("rio", nil)) // empty
 
 	// Filter logic rebuilt
-	filtered := loaded.SearchOneTermWithFilter("sunny", map[string][]interface{}{"year": {"2021"}})
+	filtered := loaded.SearchOneTerm("sunny", map[string][]interface{}{"year": {"2021"}})
 	assertIDs(t, filtered, "2")
-	filtered = loaded.SearchOneTermWithFilter("sunny", map[string][]interface{}{"year": {"2020"}})
+	filtered = loaded.SearchOneTerm("sunny", map[string][]interface{}{"year": {"2020"}})
 	assertIDs(t, filtered) // empty
 
 	// Derived structures sanity checks (not exhaustive, but ensures rebuild happened)
 	if loaded.DataMap["sunny"] == nil {
 		t.Fatalf("expected DataMap to contain 'sunny' after rebuild")
 	}
-	if loaded.FilterDocs["year:2021"] == nil || len(loaded.FilterDocs["year:2021"]) == 0 {
-		t.Fatalf("expected FilterDocs to contain key 'year:2021' after rebuild")
+	yearBits := loaded.FilterBits["year:2021"]
+	hasAny := false
+	for _, w := range yearBits {
+		if w != 0 {
+			hasAny = true
+			break
+		}
+	}
+	if !hasAny {
+		t.Fatalf("expected FilterBits['year:2021'] to have bits set after rebuild")
 	}
 
 	// Prefix should have 'sunny' under 'su' (exact placement depends on your prefix builder)
@@ -476,8 +483,8 @@ func TestSaveLoad_RebuildsIndexesFromDocuments(t *testing.T) {
 		t.Fatalf("AddOrUpdateDocument doc3 after load: %v", err)
 	}
 
-	assertIDs(t, loaded.SearchOneTermWithoutFilter("rio"), "3")
-	assertIDs(t, loaded.SearchOneTermWithoutFilter("sunny"), "2", "3")
+	assertIDs(t, loaded.SearchOneTerm("rio", nil), "3")
+	assertIDs(t, loaded.SearchOneTerm("sunny", nil), "2", "3")
 }
 
 func TestMultiTermSearch_E2E(t *testing.T) {
@@ -729,9 +736,7 @@ func TestIndex_MultipleBatches(t *testing.T) {
 }
 
 func TestMinHeap_PushPopOrder(t *testing.T) {
-	h := &minHeap{}
-
-	heap.Init(h)
+	var h []internalHit
 
 	input := []internalHit{
 		{id: 1, score: 50},
@@ -742,101 +747,122 @@ func TestMinHeap_PushPopOrder(t *testing.T) {
 	}
 
 	for _, v := range input {
-		heap.Push(h, v)
+		h = heapPushHit(h, v)
 	}
 
-	expectedOrder := []int{5, 10, 20, 30, 50}
+	n := len(h)
+	out := make([]internalHit, n)
+	for i := n - 1; i >= 0; i-- {
+		hit := h[0]
+		if i > 0 {
+			h[0] = h[i]
+			siftDownHit(h, 0, i)
+		}
+		out[i] = hit
+	}
 
-	for _, want := range expectedOrder {
-		got := heap.Pop(h).(internalHit)
-		if got.score != want {
-			t.Errorf("expected %v, got %v", want, got.score)
+	expectedOrder := []int{50, 30, 20, 10, 5}
+	for i, want := range expectedOrder {
+		if out[i].score != want {
+			t.Errorf("index %d: expected %v, got %v", i, want, out[i].score)
 		}
 	}
 }
 
 func TestMinHeap_Len(t *testing.T) {
-	h := &minHeap{}
-	heap.Init(h)
+	var h []internalHit
 
-	if h.Len() != 0 {
+	if len(h) != 0 {
 		t.Fatalf("expected empty heap")
 	}
 
-	heap.Push(h, internalHit{id: 1, score: 10})
-	heap.Push(h, internalHit{id: 2, score: 20})
+	h = heapPushHit(h, internalHit{id: 1, score: 10})
+	h = heapPushHit(h, internalHit{id: 2, score: 20})
 
-	if h.Len() != 2 {
-		t.Fatalf("expected len 2, got %d", h.Len())
+	if len(h) != 2 {
+		t.Fatalf("expected len 2, got %d", len(h))
 	}
 }
 
 func TestMinHeap_SingleElement(t *testing.T) {
-	h := &minHeap{}
-	heap.Init(h)
+	var h []internalHit
 
-	heap.Push(h, internalHit{id: 1, score: 42})
+	h = heapPushHit(h, internalHit{id: 1, score: 42})
 
-	x := heap.Pop(h).(internalHit)
-
-	if x.score != 42 {
-		t.Errorf("expected 42, got %v", x.score)
+	n := len(h)
+	out := make([]internalHit, n)
+	for i := n - 1; i >= 0; i-- {
+		hit := h[0]
+		if i > 0 {
+			h[0] = h[i]
+			siftDownHit(h, 0, i)
+		}
+		out[i] = hit
 	}
 
-	if h.Len() != 0 {
-		t.Errorf("expected empty heap after pop")
+	if out[0].score != 42 {
+		t.Errorf("expected 42, got %v", out[0].score)
 	}
 }
 
 func TestMinHeap_StabilityRandomInsertions(t *testing.T) {
-	h := &minHeap{}
-	heap.Init(h)
+	var h []internalHit
 
 	values := []int{100, 1, 50, 2, 99, 3, 75, 4, 60}
 
 	for i, v := range values {
-		heap.Push(h, internalHit{id: uint32(i), score: v})
+		h = heapPushHit(h, internalHit{id: uint32(i), score: v})
 	}
 
-	last := -1
-
-	for h.Len() > 0 {
-		x := heap.Pop(h).(internalHit)
-		if last > x.score {
-			t.Errorf("heap order violated: %v came after %v", x.score, last)
+	n := len(h)
+	out := make([]internalHit, n)
+	for i := n - 1; i >= 0; i-- {
+		hit := h[0]
+		if i > 0 {
+			h[0] = h[i]
+			siftDownHit(h, 0, i)
 		}
-		last = x.score
+		out[i] = hit
+	}
+
+	for i := 1; i < len(out); i++ {
+		if out[i].score > out[i-1].score {
+			t.Errorf("heap order violated at index %d: %v > %v", i, out[i].score, out[i-1].score)
+		}
 	}
 }
 
 func TestMinHeap_StabilityRandomInsertions2(t *testing.T) {
-	h := &minHeap{}
-	heap.Init(h)
+	var h []internalHit
 
 	values := []int{100, 105, 1, 50, 2, 99, 101, 3, 75, 4, 60, 104, 110, 95, 90, 90, 106, 8, 111, 101, 106, 79}
 
 	k := 5
 	for i, score := range values {
-		if h.Len() < k {
-			heap.Push(h, internalHit{id: uint32(i), score: score})
-		} else if (*h)[0].score < score {
-			heap.Pop(h)
-			heap.Push(h, internalHit{id: uint32(i), score: score})
+		if len(h) < k {
+			h = heapPushHit(h, internalHit{id: uint32(i), score: score})
+		} else if h[0].score < score {
+			heapReplaceTop(h, internalHit{id: uint32(i), score: score})
 		}
 	}
 
-	last := -1
-
-	var scores []int
-	for h.Len() > 0 {
-		x := heap.Pop(h).(internalHit)
-		if last > x.score {
-			t.Errorf("heap order violated: %v came after %v", x.score, last)
+	n := len(h)
+	scores := make([]int, n)
+	for i := n - 1; i >= 0; i-- {
+		hit := h[0]
+		if i > 0 {
+			h[0] = h[i]
+			siftDownHit(h, 0, i)
 		}
-		last = x.score
-		scores = append(scores, x.score)
+		scores[i] = hit.score
 	}
-	if scores[0] != 105 || scores[1] != 106 || scores[2] != 106 || scores[3] != 110 || scores[4] != 111 {
-		t.Errorf("Score violated")
+
+	for i := 1; i < len(scores); i++ {
+		if scores[i] > scores[i-1] {
+			t.Errorf("heap order violated at index %d: %v > %v", i, scores[i], scores[i-1])
+		}
+	}
+	if scores[0] != 111 || scores[1] != 110 || scores[2] != 106 || scores[3] != 106 || scores[4] != 105 {
+		t.Errorf("Score violated: got %v", scores)
 	}
 }

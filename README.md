@@ -17,30 +17,45 @@ A lightweight, fast, in-memory inverted-index search engine with HTTP handlers a
 
 ## Benchmark
 
-**Latency statistics for 5 million data**
+All numbers are from an Apple M1 Pro. Dataset uses a synthetic corpus with 1 000+ unique vocabulary words, `title` (3–20 words) and `tags` (1–10 words) index fields, and a `year` (2000–2024) filter field. Queries are a realistic mix: 65% exact, 25% prefix, 10% misspelled; multi-term queries use 2–4 tokens.
 
-|     Avg |      P50 |       P95 |       P99 | Index Time |
-|-------: | -------: | --------: | --------: | ---------: |
-| 6.76 ms |  3.52 ms |  20.95 ms |  56.55 ms |      1m42s |
+### Indexing
 
+| Corpus | Index time |
+|-------:|----------:|
+| 1 M docs | ~13.5 s |
+| 5 M docs | ~2 m 10 s |
 
-#### Details
+### Go benchmark — in-process (p50 / p99 / memory per query)
 
-* **Total requests**: 10000 requests with 8 parallel workers in 9 seconds for 5 million data
-* **Query lengths**: 1 to 4 terms e.g., `Last Night`, `The Only Thing Br`, `Modern`, `Real Ghod Time`
-* **Prefix matching**: e.g., `Modern ta` matches `Modern Talking`
-* **Typo tolerance**: \~10% of queries include deliberate misspellings (e.g., `Never Was an mngel` for “angel”)
-* **Dataset**: MusicBrainz
-* **Record format** (JSON lines):
+| Query type | Corpus | p50 | p99 | B/op |
+|---|---|---:|---:|---:|
+| Single / NoFilter | 1 M | 221 µs | 873 µs | 17 KB |
+| Single / Filter   | 1 M | 228 µs | 870 µs | 17 KB |
+| Multi  / NoFilter | 1 M | 541 µs | 2 956 µs | 16 KB |
+| Multi  / Filter   | 1 M | 277 µs | 1 157 µs | 15 KB |
+| Single / NoFilter | 5 M | 1 397 µs | 6 504 µs | 17 KB |
+| Single / Filter   | 5 M | 1 564 µs | 7 457 µs | 17 KB |
+| Multi  / NoFilter | 5 M | 5 469 µs | 25 091 µs | 50 KB |
+| Multi  / Filter   | 5 M | 1 783 µs | 10 783 µs | 50 KB |
 
-  ```json
-  {"artist":"Modern Talking","song":"Heart of an Angel","id":"c7eda459-c11c-362f-a5c9-2c108c4a27e4","album":"Universe: The 12th Album"}
-  {"artist":"Modern Talking","song":"Who Will Be There","id":"366f83d1-bd0a-3ed8-9974-b148ae6d6dd9","album":"Universe: The 12th Album"}
-  ```
-* **Indexed fields**: `artist`, `song`, `album`
-* **Machine**: Used MacBook Air M3, 24GB Memory
-* **Pagination**: 10 pages per request
-* loadtest/loadtest.go file is used to perform the test
+Filter memory is equal to no-filter because filter resolution uses a bitset stored permanently in the engine (zero per-query allocation via a single shared `RLock` window).
+
+### HTTP load test — 1 M docs, 16 workers, 10 000 requests
+
+50 % of requests include a `year` filter; 50 % are multi-term.
+
+| Mode | avg | p50 | p95 | p99 | count |
+|---|---:|---:|---:|---:|---:|
+| **Overall** | 1.70 ms | 1.46 ms | 3.44 ms | 6.14 ms | 10 000 |
+| Single / NoFilter | 1.55 ms | 1.39 ms | 2.79 ms | 5.15 ms | 2 496 |
+| Single / Filter   | 1.61 ms | 1.43 ms | 2.96 ms | 5.08 ms | 2 555 |
+| Multi  / NoFilter | 2.31 ms | 1.95 ms | 4.75 ms | 8.29 ms | 2 460 |
+| Multi  / Filter   | 1.33 ms | 1.22 ms | 2.35 ms | 3.83 ms | 2 489 |
+
+**RPS: 9 292** at 16 workers with 0 errors.
+
+Multi/Filter is faster than Multi/NoFilter because the bitset pre-prunes the candidate set before the anchor-group scan.
 
 ---
 
@@ -76,45 +91,101 @@ docker run -d \
 
 ## How It Works
 
-### Index Design
+### 1. Inverted Index
 
-This engine keeps the core inverted index in memory and uses tombstones for updates/deletes.
+```go
+DataMap map[string]map[uint32]int
+// term → internalDocID → score
+```
 
-#### 1. **Inverted Index (`DataMap`)**
+Every document is tokenized from the configured `IndexFields` (lowercased, non-alphanumeric stripped, stop-words removed). Each token gets a score of `100 000 ÷ (total tokens in that document)`. If the same token appears multiple times its scores are summed, so denser matches rank higher. This single map is the only data structure the search hot-path reads.
 
-   ```go
-   DataMap map[string]map[uint32]int
-   // term -> internalDocID -> score
-   ```
+### 2. Internal IDs and Tombstones
 
-   * Each document is tokenized from the configured `IndexFields`.
-   * Each token contributes a per-document score of `100000 ÷ (total tokens in that document)`. 
-   * If a token appears multiple times in a doc, its score is summed.
+Documents are identified internally by a monotonically increasing `uint32`:
 
-#### 2. **Internal IDs + Tombstones**
+| Map | Purpose |
+|---|---|
+| `ExternalToInternal` | caller’s string ID → current internal ID |
+| `InternalToExternal` | internal ID → caller’s string ID |
+| `Documents` | internal ID → raw field map |
+| `DocDeleted` | internal ID → tombstoned? |
 
-   Documents are stored and referenced by an internal numeric ID:
+**Update semantics**: updating a document assigns a new internal ID and sets `DocDeleted[oldID] = true`. The old posting-list entries are never removed; searches skip tombstoned IDs at scan time. This makes updates O(1) on the index at the cost of some wasted posting-list entries, which is the right trade-off for write-heavy workloads.
 
-   * `ExternalToInternal`: external string ID → current internal ID
-   * `InternalToExternal`: internal ID → external ID
-   * `DocDeleted[internalID] = true` tombstones old versions
-  
-   Update semantics:
+### 3. Prefix and Fuzzy Matching
 
-   * Updating a doc creates a new internal ID and tombstones the old internal ID.
-   * Searches always skip tombstoned internal IDs.
-   
-   This avoids expensive deletions from posting lists at update time.
+At index time, every new term seeds three auxiliary structures:
 
-#### 3. **Prefix & Fuzzy Structures**
+- **`Prefix map[string][]string`** — each prefix of length 1…n−1 maps to a list of matching full terms (capped at `MaxPrefixTerms = 400`). Prefix lookup is O(1) at query time.
+- **`Keys`** — a hash set of all known terms; used for O(1) exact-match existence checks before hitting the posting map.
+- **`SymSpell`** — a Levenshtein-distance index used for fuzzy suggestions when prefix candidates are insufficient.
 
-   During indexing, tokens are also inserted into:
+Single-term search tries prefix candidates first. If there are none it falls back to SymSpell suggestions. Multi-term search applies fuzzy expansion on all-but-last tokens, and prefix expansion on the last token (the partially-typed word).
 
-   * `Prefix map[string][]string`: a precomputed list of prefix → candidate terms (capped by `MaxPrefixTerms`)
-   * `Keys`: a set of known terms (fast exact existence checks)
-   * `SymSpell`: used to suggest fuzzy terms when prefix candidates are insufficient
+### 4. Bitset Filters
 
-  Single-term search prefers prefix candidates; when prefix isn’t enough it falls back to SymSpell suggestions.
+Filter fields (e.g. `year`) are stored as permanent per-value bitsets instead of per-query maps:
+
+```go
+FilterBits map[string][]uint64
+// "year:2020" → []uint64  (bit i set ↔ internalDocID i matches)
+```
+
+At index time each matching internal ID flips one bit: `bits[id>>6] |= 1 << (id&63)`. At query time a single bit test replaces a map lookup:
+
+```
+filterBitTest(allowed, id)  →  bits[id>>6] & (1<<(id&63)) != 0
+```
+
+**Memory**: ~1.25 MB per filter value per 1 M documents, paid once at index time.  
+**Per-query allocation**: zero for the common case (single field, single value) — see §6.
+
+Multi-value filters within one field are ORed (bitwise union); multiple fields are ANDed (bitwise intersection). Both operations produce a new `[]uint64` and are O(N/64) where N is the highest internal ID.
+
+### 5. Top-k Extraction with a Specialized Min-Heap
+
+Search maintains a bounded min-heap of the top-k candidates:
+
+```go
+type internalHit struct { id uint32; score int }
+```
+
+The heap operations (`heapPushHit`, `heapReplaceTop`, `siftDownHit`) are inlined directly over `[]internalHit` with no interface dispatch or boxing — unlike `container/heap` which boxes every element into `any`. At k = 100 this saves ~200 allocations per query.
+
+**Fill phase**: while `len(h) < k`, push every passing candidate. Once full, replace the root only when `candidate.score > h[0].score` (the current minimum).
+
+**Extraction phase**: repeated inline heap-pop fills the result slice from the last index down, yielding results in descending score order without an extra sort pass.
+
+### 6. Concurrency and Zero-Copy Filter Resolution
+
+The engine uses a single `sync.RWMutex`:
+
+- All search paths hold **`RLock`** — unlimited concurrent readers, no blocking between searches.
+- Index writes (`addToDocumentIndex`, `BuildDocumentIndex`, `AddOrUpdateDocument`) hold **`Lock`** — exclusive, blocks new readers until the write completes.
+
+`SearchOneTerm` and `SearchMultiTerms` acquire `RLock` **once at the top** and hold it across both filter resolution and the posting-map scan:
+
+```
+RLock acquired
+  └─ applyFilterLocked()   →  returns direct []uint64 reference (no copy)
+  └─ posting-map scan      →  filterBitTest reads from same reference
+RLock released
+```
+
+For the common case (single field, single value), `applyFilterLocked` returns a slice header pointing directly into `se.FilterBits` with zero allocation. The RLock guarantees the backing array is immutable for the duration of the search. This is why filtered and unfiltered queries show identical B/op in the benchmarks.
+
+### 7. Multi-Term Search: Anchor-Group Strategy
+
+Multi-term queries use a boolean AND-across-groups, OR-within-group model. A "group" is a set of synonyms or expansions for one query token.
+
+Rather than intersecting all groups eagerly, the engine picks the **smallest group** (fewest total posting entries) as the anchor and iterates only its candidates. For each candidate it checks membership in every other group with a map lookup — O(1) per group. This avoids materialising a full intersection set and keeps multi-term search fast even when individual terms are common.
+
+Score for a matching document is the sum of its scores across all matched groups.
+
+### 8. Persistence
+
+`SaveAll` serialises only the raw document store and metadata (IDs, field config) to a single gob file. `LoadAll` restores the documents and then rebuilds all derived structures — `DataMap`, `FilterBits`, `Prefix`, `Keys`, `SymSpell` — by replaying the tokenisation pass. This keeps the snapshot compact and means the on-disk format never needs a schema migration when internal data structures change.
 
 
 ## HTTP API
@@ -235,6 +306,65 @@ go test -race -count=1 ./... \
 
 go tool cover -func=coverage.out
 ```
+
+---
+
+## Load Testing
+
+### Step 1 — generate the dataset
+
+```bash
+# 1 million documents (~200 MB JSON)
+go run ./cmd/datagen -count 1000000 -out data.json
+
+# 5 million documents
+go run ./cmd/datagen -count 5000000 -out data5m.json
+```
+
+Generated documents look like:
+
+```json
+{"id":"d0","title":"forge silent lunar craft vast","tags":"swift rural","year":2017}
+```
+
+Fields: `title` (3–20 words), `tags` (1–10 words), `year` (2000–2024).
+
+### Step 2 — start the server and load data
+
+```bash
+go run ./cmd/service
+
+# create index — title + tags indexed, year as filter field
+curl -X POST http://localhost:8080/create-index \
+  -H 'Content-Type: application/json' \
+  -d '{"indexName":"bench","indexFields":["title","tags"],"filters":["year"],"resultCount":100}'
+
+# upload and index the JSON file
+curl -X POST 'http://localhost:8080/add-to-index?indexName=bench' \
+  -F 'file=@data.json'
+```
+
+### Step 3 — run the load test
+
+```bash
+go run ./loadtest \
+  -index bench \
+  -requests 10000 \
+  -workers 16 \
+  -filter-pct 50 \
+  -multi-pct 50
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `-url` | `http://localhost:8080/search` | Search endpoint |
+| `-index` | `bench` | Index name |
+| `-workers` | `8` | Parallel goroutines |
+| `-requests` | `10000` | Total requests |
+| `-filter-pct` | `50` | % of requests with a year filter |
+| `-multi-pct` | `50` | % of requests using multi-term queries |
+| `-timeout` | `10s` | Per-request HTTP timeout |
+| `-seed` | random | RNG seed for reproducibility |
 
 ---
 
