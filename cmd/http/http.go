@@ -86,29 +86,27 @@ func NewHTTP() *HTTP {
 	}
 }
 
-func ErrWriter(w http.ResponseWriter, err error) {
-	var jsonBytes []byte
-	jsonBytes, jsonErr := json.Marshal(map[string]interface{}{
+func errJSON(w http.ResponseWriter, statusCode int, err error) {
+	body, jsonErr := json.Marshal(map[string]interface{}{
 		"err": fmt.Sprintf("%v", err),
 	})
 	if jsonErr != nil {
-		jsonBytes = []byte(fmt.Sprintf("err: %v", err))
+		body = []byte(fmt.Sprintf(`{"err":%q}`, err.Error()))
 	}
-
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusInternalServerError)
-	w.Write(jsonBytes)
+	w.WriteHeader(statusCode)
+	w.Write(body)
 }
 
 func (ht *HTTP) Search(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		ErrWriter(w, errors.New("unsupported method"))
+		errJSON(w, http.StatusMethodNotAllowed, errors.New("unsupported method"))
 		return
 	}
 
 	indexName := r.URL.Query().Get("index")
 	if indexName == "" {
-		ErrWriter(w, errors.New("`index` query parameter is required"))
+		errJSON(w, http.StatusBadRequest, errors.New("`index` query parameter is required"))
 		return
 	}
 
@@ -116,7 +114,7 @@ func (ht *HTTP) Search(w http.ResponseWriter, r *http.Request) {
 	sec, ok := ht.engines[indexName]
 	ht.mu.RUnlock()
 	if !ok {
-		ErrWriter(w, fmt.Errorf("index %q not found", indexName))
+		errJSON(w, http.StatusNotFound, fmt.Errorf("index %q not found", indexName))
 		return
 	}
 
@@ -159,25 +157,25 @@ func (ht *HTTP) Search(w http.ResponseWriter, r *http.Request) {
 func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
-		ErrWriter(w, fmt.Errorf("method not allowed"))
+		errJSON(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
 		return
 	}
 
 	var req CreateIndexRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		ErrWriter(w, fmt.Errorf("invalid JSON payload: %w", err))
+		errJSON(w, http.StatusBadRequest, fmt.Errorf("invalid JSON payload: %w", err))
 		return
 	}
 
 	if req.IndexName == "" {
-		ErrWriter(w, errors.New("`indexName` is required"))
+		errJSON(w, http.StatusBadRequest, errors.New("`indexName` is required"))
 		return
 	}
 	ht.mu.RLock()
 	_, exists := ht.engines[req.IndexName]
 	ht.mu.RUnlock()
 	if exists {
-		ErrWriter(w, fmt.Errorf("index %q already exists", req.IndexName))
+		errJSON(w, http.StatusConflict, fmt.Errorf("index %q already exists", req.IndexName))
 		return
 	}
 
@@ -215,13 +213,13 @@ func (ht *HTTP) CreateIndex(w http.ResponseWriter, r *http.Request) {
 func (ht *HTTP) AddToIndex(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
-		ErrWriter(w, fmt.Errorf("method not allowed"))
+		errJSON(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
 		return
 	}
 
 	indexName := r.URL.Query().Get("indexName")
 	if indexName == "" {
-		ErrWriter(w, errors.New("`indexName` query parameter is required"))
+		errJSON(w, http.StatusBadRequest, errors.New("`indexName` query parameter is required"))
 		return
 	}
 
@@ -229,24 +227,24 @@ func (ht *HTTP) AddToIndex(w http.ResponseWriter, r *http.Request) {
 	sec, ok := ht.engines[indexName]
 	ht.mu.RUnlock()
 	if !ok {
-		ErrWriter(w, fmt.Errorf("index %q not found", indexName))
+		errJSON(w, http.StatusNotFound, fmt.Errorf("index %q not found", indexName))
 		return
 	}
 
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		ErrWriter(w, fmt.Errorf("invalid multipart form: %w", err))
+		errJSON(w, http.StatusBadRequest, fmt.Errorf("invalid multipart form: %w", err))
 		return
 	}
 	file, _, err := r.FormFile("file")
 	if err != nil {
-		ErrWriter(w, fmt.Errorf("file upload required: %w", err))
+		errJSON(w, http.StatusBadRequest, fmt.Errorf("file upload required: %w", err))
 		return
 	}
 	defer file.Close()
 
 	raw, err := io.ReadAll(file)
 	if err != nil {
-		ErrWriter(w, fmt.Errorf("unable to read uploaded file: %w", err))
+		errJSON(w, http.StatusInternalServerError, fmt.Errorf("unable to read uploaded file: %w", err))
 		return
 	}
 
@@ -257,7 +255,7 @@ func (ht *HTTP) AddToIndex(w http.ResponseWriter, r *http.Request) {
 		rdr := csv.NewReader(bytes.NewReader(raw))
 		rows, err2 := rdr.ReadAll()
 		if err2 != nil || len(rows) < 2 {
-			ErrWriter(w, fmt.Errorf("invalid JSON or CSV in file: %v / %v", err, err2))
+			errJSON(w, http.StatusBadRequest, fmt.Errorf("invalid JSON or CSV in file: %v / %v", err, err2))
 			return
 		}
 		headers := rows[0]
@@ -303,27 +301,37 @@ type LoadEngineRequest struct {
 func (ht *HTTP) SaveEngine(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
-		ErrWriter(w, fmt.Errorf("unsupported method"))
+		errJSON(w, http.StatusMethodNotAllowed, fmt.Errorf("unsupported method"))
 		return
 	}
 	var req SaveEngineRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		ErrWriter(w, fmt.Errorf("invalid JSON payload: %w", err))
+		errJSON(w, http.StatusBadRequest, fmt.Errorf("invalid JSON payload: %w", err))
 		return
 	}
 	if req.IndexName == "" {
-		ErrWriter(w, fmt.Errorf("`indexName` is required"))
+		errJSON(w, http.StatusBadRequest, fmt.Errorf("`indexName` is required"))
 		return
 	}
 	ht.mu.RLock()
 	sec, ok := ht.engines[req.IndexName]
 	ht.mu.RUnlock()
 	if !ok {
-		ErrWriter(w, fmt.Errorf("index %q not found", req.IndexName))
+		errJSON(w, http.StatusNotFound, fmt.Errorf("index %q not found", req.IndexName))
 		return
 	}
-	if err := sec.SaveAll(req.IndexName); err != nil {
-		ErrWriter(w, fmt.Errorf("failed to save engine: %w", err))
+
+	baseDir := os.Getenv("INDEX_DATA_DIR")
+	if baseDir == "" {
+		baseDir = "./data"
+	}
+	dataDir := filepath.Join(baseDir, req.IndexName)
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		errJSON(w, http.StatusInternalServerError, fmt.Errorf("failed to create data dir: %w", err))
+		return
+	}
+	if err := sec.SaveAll(dataDir); err != nil {
+		errJSON(w, http.StatusInternalServerError, fmt.Errorf("failed to save engine: %w", err))
 		return
 	}
 	resp := map[string]interface{}{
@@ -339,17 +347,17 @@ func (ht *HTTP) SaveEngine(w http.ResponseWriter, r *http.Request) {
 func (ht *HTTP) LoadEngine(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
-		ErrWriter(w, fmt.Errorf("unsupported method"))
+		errJSON(w, http.StatusMethodNotAllowed, fmt.Errorf("unsupported method"))
 		return
 	}
 
 	var req LoadEngineRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		ErrWriter(w, fmt.Errorf("invalid JSON payload: %w", err))
+		errJSON(w, http.StatusBadRequest, fmt.Errorf("invalid JSON payload: %w", err))
 		return
 	}
 	if req.IndexName == "" {
-		ErrWriter(w, fmt.Errorf("`indexName` is required"))
+		errJSON(w, http.StatusBadRequest, fmt.Errorf("`indexName` is required"))
 		return
 	}
 
@@ -362,11 +370,14 @@ func (ht *HTTP) LoadEngine(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	eng, err := engine.LoadAll(dataDir)
 	if err != nil {
-		ErrWriter(w, err)
+		errJSON(w, http.StatusInternalServerError, err)
 		return
 	}
 
+	ht.mu.Lock()
 	ht.engines[req.IndexName] = eng
+	ht.mu.Unlock()
+
 	duration := time.Since(start)
 
 	resp := map[string]interface{}{
@@ -387,7 +398,7 @@ func (ht *HTTP) LoadEngine(w http.ResponseWriter, r *http.Request) {
 func (ht *HTTP) AddOrUpdateDocument(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
-		ErrWriter(w, fmt.Errorf("method not allowed"))
+		errJSON(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
 		return
 	}
 
@@ -396,18 +407,18 @@ func (ht *HTTP) AddOrUpdateDocument(w http.ResponseWriter, r *http.Request) {
 
 	var req AddOrUpdateDocumentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		ErrWriter(w, fmt.Errorf("invalid JSON payload: %w", err))
+		errJSON(w, http.StatusBadRequest, fmt.Errorf("invalid JSON payload: %w", err))
 		return
 	}
 	if indexName == "" {
 		indexName = req.IndexName
 	}
 	if indexName == "" {
-		ErrWriter(w, errors.New("`indexName` is required (query param or JSON body)"))
+		errJSON(w, http.StatusBadRequest, errors.New("`indexName` is required (query param or JSON body)"))
 		return
 	}
 	if req.Document == nil {
-		ErrWriter(w, errors.New("`document` is required"))
+		errJSON(w, http.StatusBadRequest, errors.New("`document` is required"))
 		return
 	}
 
@@ -416,25 +427,25 @@ func (ht *HTTP) AddOrUpdateDocument(w http.ResponseWriter, r *http.Request) {
 	sec, ok := ht.engines[indexName]
 	ht.mu.RUnlock()
 	if !ok {
-		ErrWriter(w, fmt.Errorf("index %q not found", indexName))
+		errJSON(w, http.StatusNotFound, fmt.Errorf("index %q not found", indexName))
 		return
 	}
 
 	// Validate id early for response fields
 	rawID, ok := req.Document["id"]
 	if !ok || rawID == nil {
-		ErrWriter(w, errors.New("document missing `id` field"))
+		errJSON(w, http.StatusBadRequest, errors.New("document missing `id` field"))
 		return
 	}
 	docID := fmt.Sprintf("%v", rawID)
 	if docID == "" || docID == "<nil>" {
-		ErrWriter(w, errors.New("invalid document `id`"))
+		errJSON(w, http.StatusBadRequest, errors.New("invalid document `id`"))
 		return
 	}
 
 	start := time.Now()
 	if err := sec.AddOrUpdateDocument(req.Document); err != nil {
-		ErrWriter(w, err)
+		errJSON(w, http.StatusInternalServerError, err)
 		return
 	}
 	duration := time.Since(start)
@@ -459,19 +470,19 @@ func (ht *HTTP) AddOrUpdateDocument(w http.ResponseWriter, r *http.Request) {
 func (ht *HTTP) DeleteDocument(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		w.Header().Set("Allow", http.MethodDelete)
-		ErrWriter(w, fmt.Errorf("method not allowed"))
+		errJSON(w, http.StatusMethodNotAllowed, fmt.Errorf("method not allowed"))
 		return
 	}
 
 	indexName := r.URL.Query().Get("indexName")
 	if indexName == "" {
-		ErrWriter(w, errors.New("`indexName` query parameter is required"))
+		errJSON(w, http.StatusBadRequest, errors.New("`indexName` query parameter is required"))
 		return
 	}
 
 	id := r.URL.Query().Get("id")
 	if id == "" {
-		ErrWriter(w, errors.New("`id` query parameter is required"))
+		errJSON(w, http.StatusBadRequest, errors.New("`id` query parameter is required"))
 		return
 	}
 
@@ -479,19 +490,13 @@ func (ht *HTTP) DeleteDocument(w http.ResponseWriter, r *http.Request) {
 	sec, ok := ht.engines[indexName]
 	ht.mu.RUnlock()
 	if !ok {
-		ErrWriter(w, fmt.Errorf("index %q not found", indexName))
+		errJSON(w, http.StatusNotFound, fmt.Errorf("index %q not found", indexName))
 		return
 	}
 
 	start := time.Now()
 	deleted := sec.DeleteDocument(id)
 	duration := time.Since(start)
-
-	// If you want "not found" to be 404, do this:
-	// if !deleted {
-	// 	http.Error(w, "document not found", http.StatusNotFound)
-	// 	return
-	// }
 
 	resp := DeleteDocumentResponse{
 		Status:     "success",
@@ -508,17 +513,15 @@ func (ht *HTTP) DeleteDocument(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// Health is a simple health‐check endpoint that returns how long it took
-// the handler to run (i.e. “ping” duration).
+// Health is a simple health-check endpoint.
 func (ht *HTTP) Health(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
-		ErrWriter(w, fmt.Errorf("unsupported method"))
+		errJSON(w, http.StatusMethodNotAllowed, fmt.Errorf("unsupported method"))
 		return
 	}
 
 	start := time.Now()
-
 	duration := time.Since(start)
 	resp := map[string]interface{}{
 		"status":     "ok",
@@ -529,6 +532,6 @@ func (ht *HTTP) Health(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		ErrWriter(w, err)
+		errJSON(w, http.StatusInternalServerError, err)
 	}
 }

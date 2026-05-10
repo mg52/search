@@ -62,8 +62,8 @@ func TestSearchHandler_NoIndex(t *testing.T) {
 	rr := httptest.NewRecorder()
 	h.Search(rr, req)
 
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500; got %d", rr.Code)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404; got %d", rr.Code)
 	}
 }
 
@@ -78,8 +78,8 @@ func TestAddToIndexHandler_InvalidIndex(t *testing.T) {
 	r.Header.Set("Content-Type", w.FormDataContentType())
 	rw := httptest.NewRecorder()
 	h.AddToIndex(rw, r)
-	if rw.Code != http.StatusInternalServerError {
-		t.Errorf("expected 500 for missing index; got %d", rw.Code)
+	if rw.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for missing index; got %d", rw.Code)
 	}
 }
 
@@ -90,8 +90,8 @@ func TestSaveEngine_Errors(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/save-controller", strings.NewReader(`{}`))
 	rr := httptest.NewRecorder()
 	ht.SaveEngine(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("expected 500 for missing indexName, got %d", rr.Code)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for missing indexName, got %d", rr.Code)
 	}
 
 	// index not found
@@ -99,8 +99,8 @@ func TestSaveEngine_Errors(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/save-controller", strings.NewReader(payload))
 	rr = httptest.NewRecorder()
 	ht.SaveEngine(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("expected 500 for index not found, got %d", rr.Code)
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for index not found, got %d", rr.Code)
 	}
 }
 
@@ -149,16 +149,16 @@ func TestSearchHandler_Errors(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/search?index=idx&q=x", nil)
 	rr := httptest.NewRecorder()
 	h.Search(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("POST /search expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST /search expected 405, got %d", rr.Code)
 	}
 
-	// Missing index
+	// Missing index param
 	req = httptest.NewRequest(http.MethodGet, "/search?q=x", nil)
 	rr = httptest.NewRecorder()
 	h.Search(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("GET /search missing index expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("GET /search missing index expected 400, got %d", rr.Code)
 	}
 }
 
@@ -168,16 +168,16 @@ func TestCreateIndexHandler_Errors(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/create-index", nil)
 	rr := httptest.NewRecorder()
 	h.CreateIndex(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("GET /create-index expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET /create-index expected 405, got %d", rr.Code)
 	}
 
 	// Invalid JSON
 	req = httptest.NewRequest(http.MethodPost, "/create-index", strings.NewReader("{bad json}"))
 	rr = httptest.NewRecorder()
 	h.CreateIndex(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("POST /create-index invalid JSON expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("POST /create-index invalid JSON expected 400, got %d", rr.Code)
 	}
 
 	// Missing indexName
@@ -185,12 +185,11 @@ func TestCreateIndexHandler_Errors(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/create-index", strings.NewReader(body))
 	rr = httptest.NewRecorder()
 	h.CreateIndex(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("POST /create-index missing indexName expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("POST /create-index missing indexName expected 400, got %d", rr.Code)
 	}
 
 	// Already exists
-	// first create valid
 	valid := `{"indexName":"dup","indexFields":["f"],"filters":[],"resultCount":1,"workers":1}`
 	req = httptest.NewRequest(http.MethodPost, "/create-index", strings.NewReader(valid))
 	rr = httptest.NewRecorder()
@@ -199,8 +198,8 @@ func TestCreateIndexHandler_Errors(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/create-index", strings.NewReader(valid))
 	rr = httptest.NewRecorder()
 	h.CreateIndex(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("POST /create-index duplicate expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusConflict {
+		t.Errorf("POST /create-index duplicate expected 409, got %d", rr.Code)
 	}
 }
 
@@ -210,16 +209,16 @@ func TestAddToIndexHandler_Errors(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/add-to-index?indexName=idx", nil)
 	rr := httptest.NewRecorder()
 	h.AddToIndex(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("GET /add-to-index expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("GET /add-to-index expected 405, got %d", rr.Code)
 	}
 
 	// Missing indexName
 	req = httptest.NewRequest(http.MethodPost, "/add-to-index", nil)
 	rr = httptest.NewRecorder()
 	h.AddToIndex(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("POST /add-to-index missing indexName expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("POST /add-to-index missing indexName expected 400, got %d", rr.Code)
 	}
 
 	// Not multipart
@@ -228,8 +227,8 @@ func TestAddToIndexHandler_Errors(t *testing.T) {
 	req.Header.Set("Content-Type", "text/plain")
 	rr = httptest.NewRecorder()
 	h.AddToIndex(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("POST /add-to-index invalid form expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("POST /add-to-index invalid form expected 400, got %d", rr.Code)
 	}
 
 	// Multipart with no file
@@ -240,8 +239,8 @@ func TestAddToIndexHandler_Errors(t *testing.T) {
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	rr = httptest.NewRecorder()
 	h.AddToIndex(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("POST /add-to-index missing file expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("POST /add-to-index missing file expected 400, got %d", rr.Code)
 	}
 }
 
@@ -252,8 +251,8 @@ func TestAddOrUpdateDocumentHandler_Errors(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/document?indexName=idx", nil)
 	rr := httptest.NewRecorder()
 	h.AddOrUpdateDocument(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("GET /document expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET /document expected 405, got %d", rr.Code)
 	}
 
 	// Missing indexName (query and body)
@@ -262,8 +261,8 @@ func TestAddOrUpdateDocumentHandler_Errors(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr = httptest.NewRecorder()
 	h.AddOrUpdateDocument(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("POST /document missing indexName expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("POST /document missing indexName expected 400, got %d", rr.Code)
 	}
 
 	// Index not found
@@ -271,8 +270,8 @@ func TestAddOrUpdateDocumentHandler_Errors(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr = httptest.NewRecorder()
 	h.AddOrUpdateDocument(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("POST /document index not found expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("POST /document index not found expected 404, got %d", rr.Code)
 	}
 
 	// Invalid JSON
@@ -281,8 +280,8 @@ func TestAddOrUpdateDocumentHandler_Errors(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr = httptest.NewRecorder()
 	h.AddOrUpdateDocument(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("POST /document invalid JSON expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("POST /document invalid JSON expected 400, got %d", rr.Code)
 	}
 
 	// Missing document
@@ -290,8 +289,8 @@ func TestAddOrUpdateDocumentHandler_Errors(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr = httptest.NewRecorder()
 	h.AddOrUpdateDocument(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("POST /document missing document expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("POST /document missing document expected 400, got %d", rr.Code)
 	}
 
 	// Missing id inside document
@@ -299,8 +298,8 @@ func TestAddOrUpdateDocumentHandler_Errors(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rr = httptest.NewRecorder()
 	h.AddOrUpdateDocument(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("POST /document missing id expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("POST /document missing id expected 400, got %d", rr.Code)
 	}
 }
 
@@ -311,32 +310,32 @@ func TestDeleteDocumentHandler_Errors(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/document?indexName=idx&id=1", nil)
 	rr := httptest.NewRecorder()
 	h.DeleteDocument(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("POST /document (delete) expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /document (delete) expected 405, got %d", rr.Code)
 	}
 
 	// Missing indexName
 	req = httptest.NewRequest(http.MethodDelete, "/document?id=1", nil)
 	rr = httptest.NewRecorder()
 	h.DeleteDocument(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("DELETE /document missing indexName expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("DELETE /document missing indexName expected 400, got %d", rr.Code)
 	}
 
 	// Missing id
 	req = httptest.NewRequest(http.MethodDelete, "/document?indexName=idx", nil)
 	rr = httptest.NewRecorder()
 	h.DeleteDocument(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("DELETE /document missing id expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("DELETE /document missing id expected 400, got %d", rr.Code)
 	}
 
 	// Index not found
 	req = httptest.NewRequest(http.MethodDelete, "/document?indexName=nope&id=1", nil)
 	rr = httptest.NewRecorder()
 	h.DeleteDocument(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("DELETE /document index not found expected 500, got %d", rr.Code)
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("DELETE /document index not found expected 404, got %d", rr.Code)
 	}
 }
 
@@ -426,17 +425,14 @@ func TestDocumentEndpoints_E2E_AddUpdateDeleteSearch(t *testing.T) {
 	}
 
 	// 2) Add documents
-	// doc1: "Sunny Rio"
 	rec := postDoc(map[string]interface{}{"id": "1", "name": "Sunny Rio", "year": "2020"})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST /document doc1 expected 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	// doc2: "Rio Nights"
 	rec = postDoc(map[string]interface{}{"id": "2", "name": "Rio Nights", "year": "2021"})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST /document doc2 expected 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	// doc3: "Cloudy Day"
 	rec = postDoc(map[string]interface{}{"id": "3", "name": "Cloudy Day", "year": "2021"})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST /document doc3 expected 200, got %d body=%s", rec.Code, rec.Body.String())
@@ -456,13 +452,9 @@ func TestDocumentEndpoints_E2E_AddUpdateDeleteSearch(t *testing.T) {
 	}
 
 	ids = extractIDs(search("rio"))
-	assertIDs(ids, "1") // doc2 should disappear due to tombstone model
+	assertIDs(ids, "1")
 
 	ids = extractIDs(search("sunny"))
-	// Depending on your SingleTermSearch prefix behavior, you might see extra matches.
-	// But for direct token "sunny", we expect doc1 + updated doc2.
-	// If your prefix expansion returns multiple terms, ensure your engine still returns docs with "sunny".
-	// This assertion expects at least these.
 	assertIDs(ids, "1", "2")
 
 	// 5) Delete doc1 and verify it disappears
@@ -498,7 +490,6 @@ func TestDocumentEndpoints_E2E_AddUpdateDeleteSearch(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&delResp); err != nil {
 		t.Fatalf("decode delete resp: %v", err)
 	}
-	// "deleted" field should be false
 	if d, ok := delResp["deleted"].(bool); ok {
 		if d {
 			t.Fatalf("expected deleted=false for non-existing doc")

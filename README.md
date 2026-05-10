@@ -23,23 +23,30 @@ All numbers are from an Apple M1 Pro. Dataset uses a synthetic corpus with 1 000
 
 | Corpus | Index time |
 |-------:|----------:|
-| 1 M docs | ~13.5 s |
-| 5 M docs | ~2 m 10 s |
+| 1 M docs | ~10.1 s |
+| 5 M docs | ~1 m 16 s |
 
 ### Go benchmark — in-process (p50 / p99 / memory per query)
 
-| Query type | Corpus | p50 | p99 | B/op |
-|---|---|---:|---:|---:|
-| Single / NoFilter | 1 M | 221 µs | 873 µs | 17 KB |
-| Single / Filter   | 1 M | 228 µs | 870 µs | 17 KB |
-| Multi  / NoFilter | 1 M | 541 µs | 2 956 µs | 16 KB |
-| Multi  / Filter   | 1 M | 277 µs | 1 157 µs | 15 KB |
-| Single / NoFilter | 5 M | 1 397 µs | 6 504 µs | 17 KB |
-| Single / Filter   | 5 M | 1 564 µs | 7 457 µs | 17 KB |
-| Multi  / NoFilter | 5 M | 5 469 µs | 25 091 µs | 50 KB |
-| Multi  / Filter   | 5 M | 1 783 µs | 10 783 µs | 50 KB |
+`go test ./internal/engine/ -bench=BenchmarkSearch -benchmem -benchtime=5s`
 
-Filter memory is equal to no-filter because filter resolution uses a bitset stored permanently in the engine (zero per-query allocation via a single shared `RLock` window).
+#### 1 M docs
+
+| Mode | p50 | p99 | B/op | allocs/op |
+|---|---:|---:|---:|---:|
+| SingleTerm / NoFilter | 222 µs | 888 µs | 16 KB | 12 |
+| SingleTerm / Filter   | 224 µs | 856 µs | 16 KB | 15 |
+| MultiTerm  / NoFilter | 542 µs | 3 011 µs | 15 KB | 34 |
+| MultiTerm  / Filter   | 281 µs | 1 167 µs | 14 KB | 36 |
+
+#### 5 M docs
+
+| Mode | p50 | p99 | B/op | allocs/op |
+|---|---:|---:|---:|---:|
+| SingleTerm / NoFilter | 894 µs | 3 551 µs | 16 KB | 12 |
+| SingleTerm / Filter   | 1 028 µs | 3 883 µs | 17 KB | 15 |
+| MultiTerm  / NoFilter | 3 560 µs | 24 594 µs | 49 KB | 41 |
+| MultiTerm  / Filter   | 1 473 µs | 7 015 µs | 50 KB | 43 |
 
 ### HTTP load test — 1 M docs, 16 workers, 10 000 requests
 
@@ -47,13 +54,27 @@ Filter memory is equal to no-filter because filter resolution uses a bitset stor
 
 | Mode | avg | p50 | p95 | p99 | count |
 |---|---:|---:|---:|---:|---:|
-| **Overall** | 1.70 ms | 1.46 ms | 3.44 ms | 6.14 ms | 10 000 |
-| Single / NoFilter | 1.55 ms | 1.39 ms | 2.79 ms | 5.15 ms | 2 496 |
-| Single / Filter   | 1.61 ms | 1.43 ms | 2.96 ms | 5.08 ms | 2 555 |
-| Multi  / NoFilter | 2.31 ms | 1.95 ms | 4.75 ms | 8.29 ms | 2 460 |
-| Multi  / Filter   | 1.33 ms | 1.22 ms | 2.35 ms | 3.83 ms | 2 489 |
+| **Overall** | 1.73 ms | 1.48 ms | 3.43 ms | 5.84 ms | 10 000 |
+| Single / NoFilter | 1.56 ms | 1.42 ms | 2.71 ms | 4.51 ms | 2 546 |
+| Single / Filter   | 1.63 ms | 1.43 ms | 2.90 ms | 5.48 ms | 2 524 |
+| Multi  / NoFilter | 2.35 ms | 1.96 ms | 4.69 ms | 9.37 ms | 2 487 |
+| Multi  / Filter   | 1.38 ms | 1.24 ms | 2.43 ms | 3.89 ms | 2 443 |
 
-**RPS: 9 292** at 16 workers with 0 errors.
+**RPS: 9 128** at 16 workers with 0 errors.
+
+### HTTP load test — 5 M docs, 16 workers, 10 000 requests
+
+50 % of requests include a `year` filter; 50 % are multi-term.
+
+| Mode | avg | p50 | p95 | p99 | count |
+|---|---:|---:|---:|---:|---:|
+| **Overall** | 12.09 ms | 9.44 ms | 27.92 ms | 57.35 ms | 10 000 |
+| Single / NoFilter | 8.61 ms | 7.58 ms | 17.45 ms | 26.26 ms | 2 576 |
+| Single / Filter   | 10.16 ms | 8.92 ms | 19.73 ms | 31.41 ms | 2 451 |
+| Multi  / NoFilter | 20.04 ms | 14.86 ms | 51.32 ms | 89.20 ms | 2 494 |
+| Multi  / Filter   | 9.61 ms | 8.22 ms | 20.09 ms | 31.29 ms | 2 479 |
+
+**RPS: 1 316** at 16 workers with 0 errors.
 
 Multi/Filter is faster than Multi/NoFilter because the bitset pre-prunes the candidate set before the anchor-group scan.
 
@@ -118,7 +139,6 @@ Documents are identified internally by a monotonically increasing `uint32`:
 At index time, every new term seeds three auxiliary structures:
 
 - **`Prefix map[string][]string`** — each prefix of length 1…n−1 maps to a list of matching full terms (capped at `MaxPrefixTerms = 400`). Prefix lookup is O(1) at query time.
-- **`Keys`** — a hash set of all known terms; used for O(1) exact-match existence checks before hitting the posting map.
 - **`SymSpell`** — a Levenshtein-distance index used for fuzzy suggestions when prefix candidates are insufficient.
 
 Single-term search tries prefix candidates first. If there are none it falls back to SymSpell suggestions. Multi-term search applies fuzzy expansion on all-but-last tokens, and prefix expansion on the last token (the partially-typed word).
@@ -190,7 +210,7 @@ Score for a matching document is the sum of its scores across all matched groups
 
 ## HTTP API
 
-All endpoints return JSON and use HTTP status codes (`201 Created`, `200 OK`, `500` on errors).
+All endpoints return JSON and use HTTP status codes (`201 Created`, `200 OK`, `400 Bad Request`, `404 Not Found`, `405 Method Not Allowed`, `409 Conflict`, `500 Internal Server Error`).
 
 ### 1. Create Index
 
@@ -315,10 +335,10 @@ go tool cover -func=coverage.out
 
 ```bash
 # 1 million documents (~200 MB JSON)
-go run ./cmd/datagen -count 1000000 -out data.json
+go run ./loadtest/datagen -count 1000000 -out data.json
 
 # 5 million documents
-go run ./cmd/datagen -count 5000000 -out data5m.json
+go run ./loadtest/datagen -count 5000000 -out data5m.json
 ```
 
 Generated documents look like:

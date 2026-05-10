@@ -454,12 +454,9 @@ func TestSaveLoad_RebuildsIndexesFromDocuments(t *testing.T) {
 		t.Fatalf("expected Prefix['su'] to be non-empty after rebuild")
 	}
 
-	// Symspell + Keys should have the indexed term
-	if loaded.Keys == nil || loaded.Keys.GetData() == nil {
-		t.Fatalf("expected Keys to be non-nil after rebuild")
-	}
-	if _, ok := loaded.Keys.GetData()["sunny"]; !ok {
-		t.Fatalf("expected Keys to contain 'sunny' after rebuild")
+	// DataMap + Symspell should have the indexed term
+	if _, ok := loaded.DataMap["sunny"]; !ok {
+		t.Fatalf("expected DataMap to contain 'sunny' after rebuild")
 	}
 	if loaded.Symspell == nil {
 		t.Fatalf("expected Symspell to be non-nil after rebuild")
@@ -864,5 +861,140 @@ func TestMinHeap_StabilityRandomInsertions2(t *testing.T) {
 	}
 	if scores[0] != 111 || scores[1] != 110 || scores[2] != 106 || scores[3] != 106 || scores[4] != 105 {
 		t.Errorf("Score violated: got %v", scores)
+	}
+}
+
+// TestSaveLoad_SingleAndMultiTermSearchAfterLoad verifies that SingleTermSearch
+// and MultiTermSearch (which use termSet) work correctly after a save/load cycle.
+func TestSaveLoad_SingleAndMultiTermSearchAfterLoad(t *testing.T) {
+	se := NewSearchEngine(
+		[]string{"title"},
+		map[string]bool{"year": true},
+		10,
+	)
+
+	docs := []map[string]interface{}{
+		{"id": "1", "title": "golden gate bridge", "year": "2020"},
+		{"id": "2", "title": "golden sunrise vista", "year": "2021"},
+		{"id": "3", "title": "bridge repairs ongoing", "year": "2020"},
+	}
+	se.Index(docs)
+
+	dir := t.TempDir()
+	if err := se.SaveAll(dir); err != nil {
+		t.Fatalf("SaveAll: %v", err)
+	}
+
+	loaded, err := LoadAll(dir)
+	if err != nil {
+		t.Fatalf("LoadAll: %v", err)
+	}
+
+	// SingleTermSearch: exact match via termSet
+	res := loaded.SingleTermSearch([]string{"golden"}, nil)
+	if len(res.Docs) == 0 {
+		t.Fatal("SingleTermSearch('golden') returned no results after load")
+	}
+	ids := make(map[string]bool)
+	for _, d := range res.Docs {
+		ids[d.ID] = true
+	}
+	if !ids["1"] || !ids["2"] {
+		t.Errorf("SingleTermSearch('golden') expected ids 1 and 2, got %v", ids)
+	}
+
+	// SingleTermSearch: prefix match (term not exact, relies on Prefix rebuild)
+	resPrefix := loaded.SingleTermSearch([]string{"brid"}, nil)
+	if len(resPrefix.Docs) == 0 {
+		t.Fatal("SingleTermSearch prefix 'brid' returned no results after load")
+	}
+
+	// SingleTermSearch: with filter
+	resFiltered := loaded.SingleTermSearch([]string{"golden"}, map[string][]interface{}{"year": {"2021"}})
+	if len(resFiltered.Docs) != 1 || resFiltered.Docs[0].ID != "2" {
+		t.Errorf("SingleTermSearch('golden', year=2021) expected only doc 2, got %v", resFiltered.Docs)
+	}
+
+	// MultiTermSearch: both terms must appear
+	resMulti := loaded.MultiTermSearch([]string{"golden", "bridge"}, nil)
+	if len(resMulti.Docs) == 0 {
+		t.Fatal("MultiTermSearch('golden bridge') returned no results after load")
+	}
+	if resMulti.Docs[0].ID != "1" {
+		t.Errorf("MultiTermSearch('golden bridge') expected doc 1 first, got %v", resMulti.Docs[0].ID)
+	}
+
+	// MultiTermSearch: with filter
+	resMultiFiltered := loaded.MultiTermSearch([]string{"golden", "bridge"}, map[string][]interface{}{"year": {"2020"}})
+	if len(resMultiFiltered.Docs) != 1 || resMultiFiltered.Docs[0].ID != "1" {
+		t.Errorf("MultiTermSearch('golden bridge', year=2020) expected only doc 1, got %v", resMultiFiltered.Docs)
+	}
+}
+
+// TestSaveLoad_BulkIndexPath verifies save/load correctness when indexing is
+// done via the bulk Index() path (InsertDocs + BuildDocumentIndex).
+func TestSaveLoad_BulkIndexPath(t *testing.T) {
+	se := NewSearchEngine(
+		[]string{"name", "tags"},
+		map[string]bool{"category": true},
+		10,
+	)
+
+	docs := []map[string]interface{}{
+		{"id": "a", "name": "swift runner", "tags": "sports outdoor", "category": "fitness"},
+		{"id": "b", "name": "calm waters", "tags": "nature peaceful", "category": "travel"},
+		{"id": "c", "name": "swift breeze", "tags": "outdoor weather", "category": "travel"},
+	}
+	se.Index(docs)
+
+	// Verify pre-save state
+	pre := se.SearchOneTerm("swift", nil)
+	if len(pre) != 2 {
+		t.Fatalf("expected 2 docs for 'swift' before save, got %d", len(pre))
+	}
+
+	dir := t.TempDir()
+	if err := se.SaveAll(dir); err != nil {
+		t.Fatalf("SaveAll: %v", err)
+	}
+
+	loaded, err := LoadAll(dir)
+	if err != nil {
+		t.Fatalf("LoadAll: %v", err)
+	}
+
+	// Exact search restored
+	post := loaded.SearchOneTerm("swift", nil)
+	if len(post) != 2 {
+		t.Fatalf("expected 2 docs for 'swift' after load, got %d", len(post))
+	}
+
+	// Filter bitset restored
+	filtered := loaded.SearchOneTerm("swift", map[string][]interface{}{"category": {"fitness"}})
+	if len(filtered) != 1 || filtered[0].ID != "a" {
+		t.Errorf("expected only doc 'a' for swift+fitness filter after load, got %v", filtered)
+	}
+
+	// OR filter within same field
+	orFiltered := loaded.SearchOneTerm("swift", map[string][]interface{}{"category": {"fitness", "travel"}})
+	if len(orFiltered) != 2 {
+		t.Errorf("expected 2 docs for swift with fitness|travel filter after load, got %d", len(orFiltered))
+	}
+
+	// termSet populated: SingleTermSearch works
+	singleRes := loaded.SingleTermSearch([]string{"calm"}, nil)
+	if len(singleRes.Docs) == 0 || singleRes.Docs[0].ID != "b" {
+		t.Errorf("SingleTermSearch('calm') after load expected doc b, got %v", singleRes.Docs)
+	}
+
+	// Mutate after load: add a new doc, verify it is searchable
+	if err := loaded.AddOrUpdateDocument(map[string]interface{}{
+		"id": "d", "name": "swift mountain", "tags": "outdoor hiking", "category": "fitness",
+	}); err != nil {
+		t.Fatalf("AddOrUpdateDocument after load: %v", err)
+	}
+	postMutate := loaded.SearchOneTerm("swift", nil)
+	if len(postMutate) != 3 {
+		t.Fatalf("expected 3 docs for 'swift' after adding doc d, got %d", len(postMutate))
 	}
 }
