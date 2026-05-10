@@ -4,11 +4,11 @@ import (
 	"log"
 	"net/http"
 
-	ht "github.com/mg52/search/cmd/http"
+	"github.com/mg52/search/internal/handler"
 )
 
 func main() {
-	ht := ht.NewHTTP()
+	ht := handler.NewHTTP()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/create-index", ht.CreateIndex)

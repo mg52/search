@@ -87,8 +87,7 @@ Multi/Filter is faster than Multi/NoFilter because the bitset pre-prunes the can
 
 ```bash
 # Run locally
-cd cmd/service/
-go run . 
+go run ./cmd/service
 ````
 
 ### Docker
@@ -335,10 +334,10 @@ go tool cover -func=coverage.out
 
 ```bash
 # 1 million documents (~200 MB JSON)
-go run ./loadtest/datagen -count 1000000 -out data.json
+go run ./cmd/datagen -count 1000000 -out data.json
 
 # 5 million documents
-go run ./loadtest/datagen -count 5000000 -out data5m.json
+go run ./cmd/datagen -count 5000000 -out data5m.json
 ```
 
 Generated documents look like:
@@ -367,7 +366,7 @@ curl -X POST 'http://localhost:8080/add-to-index?indexName=bench' \
 ### Step 3 — run the load test
 
 ```bash
-go run ./loadtest \
+go run ./cmd/loadtest \
   -index bench \
   -requests 10000 \
   -workers 16 \

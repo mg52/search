@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mg52/search/internal/pkg/symspell"
+	"github.com/mg52/search/internal/symspell"
 )
 
 type internalHit struct {
