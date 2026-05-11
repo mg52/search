@@ -1,40 +1,45 @@
 package symspell
 
-import (
-	"sync"
-)
-
 // SymSpell implements the Symmetric-Delete spelling correction algorithm
 // for edit-distance-1 fuzzy search. It precomputes all single-character
 // deletions of each dictionary word and stores them in a map for O(m) lookup.
+//
+// Thread safety: SymSpell has no internal lock. Callers must ensure that
+// AddWord/DeleteWord are not called concurrently with FuzzySearch. In the
+// engine this is guaranteed by se.mu (writes under Lock, reads under RLock).
 
 type SymSpell struct {
-	DeleteMap map[string]map[string]struct{}
-	mu        sync.RWMutex
+	DeleteMap map[string][]string
 }
 
-// NewSymSpell creates a SymSpell instance.
 func NewSymSpell() *SymSpell {
 	return &SymSpell{
-		DeleteMap: make(map[string]map[string]struct{}),
+		DeleteMap: make(map[string][]string),
 	}
 }
 
 // AddWord indexes a new word by generating all its single-character deletes.
 func (s *SymSpell) AddWord(word string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, exists := s.DeleteMap[word]; !exists {
-		s.DeleteMap[word] = make(map[string]struct{})
+	s.appendUnique(word, word)
+	if len(word) < 2 {
+		return
 	}
-	s.DeleteMap[word][word] = struct{}{}
+	buf := make([]byte, len(word)-1)
 	for i := 0; i < len(word); i++ {
-		del := word[:i] + word[i+1:]
-		if _, exists := s.DeleteMap[del]; !exists {
-			s.DeleteMap[del] = make(map[string]struct{})
-		}
-		s.DeleteMap[del][word] = struct{}{}
+		copy(buf, word[:i])
+		copy(buf[i:], word[i+1:])
+		s.appendUnique(string(buf), word)
 	}
+}
+
+// appendUnique adds word to DeleteMap[key] only if not already present.
+func (s *SymSpell) appendUnique(key, word string) {
+	for _, w := range s.DeleteMap[key] {
+		if w == word {
+			return
+		}
+	}
+	s.DeleteMap[key] = append(s.DeleteMap[key], word)
 }
 
 // LoadDictionary adds all words in the slice to the SymSpell index.
@@ -44,48 +49,54 @@ func (s *SymSpell) LoadDictionary(words []string) {
 	}
 }
 
-// DeleteWord removes a word from the SymSpell index, including its
-// entry for exact match and all its single-character deletions.
+// DeleteWord removes a word from the SymSpell index.
 func (s *SymSpell) DeleteWord(word string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	// Remove the word itself
-	if originals, exists := s.DeleteMap[word]; exists {
-		delete(originals, word)
-		if len(originals) == 0 {
-			delete(s.DeleteMap, word)
-		}
+	s.removeFrom(word, word)
+	if len(word) < 2 {
+		return
 	}
-	// Remove word from all deletion variants
+	buf := make([]byte, len(word)-1)
 	for i := 0; i < len(word); i++ {
-		d := word[:i] + word[i+1:]
-		if originals, exists := s.DeleteMap[d]; exists {
-			delete(originals, word)
-			if len(originals) == 0 {
-				delete(s.DeleteMap, d)
+		copy(buf, word[:i])
+		copy(buf[i:], word[i+1:])
+		s.removeFrom(string(buf), word)
+	}
+}
+
+// removeFrom removes word from DeleteMap[key], deleting the key if empty.
+func (s *SymSpell) removeFrom(key, word string) {
+	words := s.DeleteMap[key]
+	for i, w := range words {
+		if w == word {
+			last := len(words) - 1
+			words[i] = words[last]
+			s.DeleteMap[key] = words[:last]
+			if last == 0 {
+				delete(s.DeleteMap, key)
 			}
+			return
 		}
 	}
 }
 
-// FuzzySearch returns all dictionary words within Levenshtein distance ≤1 of query.
+// FuzzySearch returns up to maxReturnCount dictionary words within
+// Levenshtein distance ≤ 1 of query. Caller must hold se.mu.RLock().
 func (s *SymSpell) FuzzySearch(query string, maxReturnCount int) []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	results := make([]string, 0, maxReturnCount)
-	seen := make(map[string]struct{}, maxReturnCount)
 
 	add := func(key string) bool {
-		if originals, ok := s.DeleteMap[key]; ok {
-			for w := range originals {
-				if w == query {
-					continue
+		for _, w := range s.DeleteMap[key] {
+			if w == query {
+				continue
+			}
+			dup := false
+			for _, r := range results {
+				if r == w {
+					dup = true
+					break
 				}
-				if _, dup := seen[w]; dup {
-					continue
-				}
-				seen[w] = struct{}{}
+			}
+			if !dup {
 				results = append(results, w)
 				if len(results) >= maxReturnCount {
 					return true
@@ -99,9 +110,15 @@ func (s *SymSpell) FuzzySearch(query string, maxReturnCount int) []string {
 		return results
 	}
 
+	if len(query) < 2 {
+		return results
+	}
+
+	buf := make([]byte, len(query)-1)
 	for i := 0; i < len(query); i++ {
-		del := query[:i] + query[i+1:]
-		if add(del) {
+		copy(buf, query[:i])
+		copy(buf[i:], query[i+1:])
+		if add(string(buf)) {
 			break
 		}
 	}

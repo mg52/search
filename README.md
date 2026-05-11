@@ -204,7 +204,7 @@ Score for a matching document is the sum of its scores across all matched groups
 
 ### 8. Persistence
 
-`SaveAll` serialises only the raw document store and metadata (IDs, field config) to a single gob file. `LoadAll` restores the documents and then rebuilds all derived structures — `DataMap`, `FilterBits`, `Prefix`, `Keys`, `SymSpell` — by replaying the tokenisation pass. This keeps the snapshot compact and means the on-disk format never needs a schema migration when internal data structures change.
+`SaveAll` serialises only the raw document store and metadata (IDs, field config) to a single gob file. `LoadAll` restores the documents and then rebuilds all derived structures — `DataMap`, `FilterBits`, `Prefix`, `SymSpell` — by replaying the tokenisation pass. This keeps the snapshot compact and means the on-disk format never needs a schema migration when internal data structures change.
 
 
 ## HTTP API
@@ -213,98 +213,106 @@ All endpoints return JSON and use HTTP status codes (`201 Created`, `200 OK`, `4
 
 ### 1. Create Index
 
-```http
-POST /create-index
-Content-Type: application/json
+Creates an empty index with the given fields and filters.
 
-{
-  "indexName":   "products",
-  "indexFields": ["name","tags"],
-  "filters":     ["year"],
-  "pageCount":   10
-}
+```bash
+curl -X POST http://localhost:8080/create-index \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "indexName":   "products",
+    "indexFields": ["name", "tags"],
+    "filters":     ["year"],
+    "resultCount": 10
+  }'
 ```
 
-Creates an *empty* index.
+### 2. Bulk Add to Index
 
-### 2. Add to Index
+Uploads a JSON file of documents and indexes them all.
 
-```http
-POST /add-to-index?indexName=products
-Content-Type: multipart/form-data
-Content-Disposition: form-data; name="file"; filename="docs.json"
-Content-Type: application/json
+```bash
+curl -X POST 'http://localhost:8080/add-to-index?indexName=products' \
+  -F 'file=@docs.json'
+```
 
-[ { "id":"1", "name":"foo", "tags":["a","b"], "year":"2020" }, ... ]
+`docs.json` must be a JSON array:
+
+```json
+[
+  { "id": "1", "name": "foo", "tags": ["a", "b"], "year": "2020" },
+  { "id": "2", "name": "bar", "tags": ["c"],       "year": "2021" }
+]
 ```
 
 ### 3. Search
 
-```http
-GET /search?index=products&q=laptop&page=0&filter=year:2020,category:electronics
+```bash
+# Simple query
+curl 'http://localhost:8080/search?index=products&q=laptop'
+
+# With a single filter
+curl 'http://localhost:8080/search?index=products&q=laptop&filter=year:2020'
+
+# With multiple filters (AND across fields, OR within a field)
+curl 'http://localhost:8080/search?index=products&q=laptop&filter=year:2020,year:2021,category:electronics'
 ```
 
-* `index`: name of the index
-* `q`: search query
-* `page`: zero-based page number
-* `filter`: comma-separated `field:value` pairs
-
+| Param | Description |
+|---|---|
+| `index` | Index name |
+| `q` | Search query (single or multi-term) |
+| `filter` | Comma-separated `field:value` pairs |
 
 ### 4. Add or Update Single Document
 
-```http
-POST /document?indexName=products
-Content-Type: application/json
+Upserts one document. If the `id` already exists the old version is tombstoned and a new one is created.
 
-{
-  "document": { "id":"14", "name":"New Name", "tags":["x"], "year":"2021" }
-}
+```bash
+curl -X POST 'http://localhost:8080/document?indexName=products' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "document": { "id": "14", "name": "New Name", "tags": ["x"], "year": "2021" }
+  }'
 ```
 
-Upserts one document (creates a new internal ID; tombstones old version if it exists).
+### 5. Delete Single Document
 
-### 6. Delete Single Document
+Tombstones the document with the given `id`.
 
-```http
-DELETE /document?indexName=products&id=14
+```bash
+curl -X DELETE 'http://localhost:8080/document?indexName=products&id=14'
 ```
 
-Tombstones the current version of the document.
+### 6. Save Index
 
-### 7. Save & Load Index (Persistence)
+Writes `engine.gob` to `/data/<indexName>/engine.gob` (or `$INDEX_DATA_DIR/<indexName>/engine.gob`).
 
-* **Save**:
-
-```http
-POST /save-controller
-Content-Type: application/json
-
-{ "indexName":"products" }
+```bash
+curl -X POST http://localhost:8080/save-controller \
+  -H 'Content-Type: application/json' \
+  -d '{ "indexName": "products" }'
 ```
 
-Writes `engine.gob` under `/data/<indexName>/engine.gob` (or `INDEX_DATA_DIR` if set).
+### 7. Load Index
 
-* **Load**:
+Loads the snapshot and rebuilds all derived indexes from stored documents.
 
-```http
-POST /load-controller
-Content-Type: application/json
-
-{ "indexName":"products" }
+```bash
+curl -X POST http://localhost:8080/load-controller \
+  -H 'Content-Type: application/json' \
+  -d '{ "indexName": "products" }'
 ```
-
-Loads the snapshot and rebuilds indexes from stored documents.
 
 ### 8. Health Check
 
-```http
-GET /ping
+```bash
+curl http://localhost:8080/health
 ```
 
-Returns:
+Response:
 
 ```json
-{ "status":"ok", "duration":"5µs", "durationMs":0 }
+{ "status": "ok", "duration": "5µs", "durationMs": 0 }
 ```
 
 ---

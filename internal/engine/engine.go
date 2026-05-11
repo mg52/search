@@ -447,7 +447,9 @@ func (se *SearchEngine) indexTokenLocked(term string, id uint32, score int) {
 	docMap, exists := se.DataMap[term]
 	if !exists {
 		se.termSet.Store(term, struct{}{})
-		se.Symspell.AddWord(term) // Symspell has its own internal lock
+		if len(term) >= 4 {
+			se.Symspell.AddWord(term)
+		}
 		for i := 1; i < len(term); i++ {
 			pfx := term[:i]
 			if len(se.Prefix[pfx]) < MaxPrefixTerms {
@@ -899,6 +901,10 @@ func (se *SearchEngine) SingleTermSearch(queryTokens []string, filters map[strin
 	_, exactExists := se.termSet.Load(queryTokens[0])
 	se.mu.RLock()
 	prefixTokens := append([]string(nil), se.Prefix[queryTokens[0]]...)
+	var fuzzyWords []string
+	if len(prefixTokens) == 0 {
+		fuzzyWords = se.Symspell.FuzzySearch(queryTokens[0], maxFuzzyTokens)
+	}
 	se.mu.RUnlock()
 
 	if len(prefixTokens) < maxPrefixTokens {
@@ -908,11 +914,8 @@ func (se *SearchEngine) SingleTermSearch(queryTokens []string, filters map[strin
 
 	if len(guessArr) > 0 {
 		parsedQuery["prefix"] = append(parsedQuery["prefix"], guessArr...)
-	} else {
-		fuzzyWords := se.Symspell.FuzzySearch(queryTokens[0], maxFuzzyTokens)
-		if len(fuzzyWords) > 0 {
-			parsedQuery["fuzzy"] = append(parsedQuery["fuzzy"], fuzzyWords...)
-		}
+	} else if len(fuzzyWords) > 0 {
+		parsedQuery["fuzzy"] = append(parsedQuery["fuzzy"], fuzzyWords...)
 	}
 
 	var finalDocs []ReturnedDocument
@@ -956,15 +959,14 @@ func (se *SearchEngine) MultiTermSearch(queryTokens []string, filters map[string
 
 	termArrList := make([][]string, len(queryTokens))
 
+	_, lastExists := se.termSet.Load(rawLastTerm)
+	se.mu.RLock()
 	for k, firstTerm := range rawFirstTerms {
 		if _, ok := se.termSet.Load(firstTerm); ok {
 			termArrList[k] = []string{firstTerm}
 		}
 		termArrList[k] = append(termArrList[k], se.Symspell.FuzzySearch(firstTerm, 10)...)
 	}
-
-	_, lastExists := se.termSet.Load(rawLastTerm)
-	se.mu.RLock()
 	maxPrefix := 40
 	if len(se.Prefix[rawLastTerm]) < maxPrefix {
 		maxPrefix = len(se.Prefix[rawLastTerm])
