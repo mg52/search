@@ -6,8 +6,6 @@ import (
 	"sort"
 	"sync"
 	"testing"
-
-	_ "embed"
 )
 
 // helper to build a SearchEngine with prepopulated FilterBits
@@ -449,9 +447,9 @@ func TestSaveLoad_RebuildsIndexesFromDocuments(t *testing.T) {
 		t.Fatalf("expected FilterBits['year:2021'] to have bits set after rebuild")
 	}
 
-	// Prefix should have 'sunny' under 'su' (exact placement depends on your prefix builder)
+	// Prefix map should have 'sunny' under prefix 'su' after rebuild
 	if len(loaded.Prefix["su"]) == 0 {
-		t.Fatalf("expected Prefix['su'] to be non-empty after rebuild")
+		t.Fatalf("expected Prefix map to have terms under 'su' after rebuild")
 	}
 
 	// DataMap + Symspell should have the indexed term

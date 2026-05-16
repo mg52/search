@@ -1,5 +1,5 @@
 // Package engine implements a lightweight, in-memory search engine
-// built on an inverted index with prefix (Trie) and fuzzy (SymSpell) matching.
+// built on an inverted index with prefix map and fuzzy (SymSpell) matching.
 // It is concurrency-safe for reads/writes via an internal RWMutex and is
 // designed to be persisted/restored via a single gob payload.
 package engine
@@ -16,6 +16,8 @@ import (
 
 	"github.com/mg52/search/internal/symspell"
 )
+
+const MaxPrefixTerms = 400
 
 type internalHit struct {
 	id    uint32
@@ -110,10 +112,6 @@ func filterBitAnd(a, b []uint64) []uint64 {
 	return out
 }
 
-// TODO: make it a variable
-// Number of max prefix for each word/term.
-const MaxPrefixTerms = 400
-
 // nonAlphaNumeric is compiled once and reused by Tokenize.
 var nonAlphaNumeric = regexp.MustCompile(`[^a-zA-Z0-9]+`)
 
@@ -165,10 +163,10 @@ type SearchEngine struct {
 	nextInternalID     uint32
 
 	// Docs + filters
-	Documents   map[uint32]map[string]interface{} // internalDocID -> doc fields
-	FilterBits  map[string][]uint64               // "field:value" -> bitset of internalDocIDs
-	Prefix      map[string][]string
-	Symspell    *symspell.SymSpell
+	Documents  map[uint32]map[string]interface{} // internalDocID -> doc fields
+	FilterBits map[string][]uint64               // "field:value" -> bitset of internalDocIDs
+	Prefix     map[string][]string               // prefix -> matching terms (capped at MaxPrefixTerms)
+	Symspell   *symspell.SymSpell
 	IndexFields []string
 	Filters     map[string]bool
 	ResultSize  int
@@ -441,11 +439,11 @@ func (se *SearchEngine) InsertDocs(docs []map[string]interface{}) {
 	}
 }
 
-// indexTokenLocked adds term -> id to DataMap, Symspell, and Prefix.
+// indexTokenLocked adds term -> id to DataMap, Symspell, and Prefix map.
 // Caller must hold se.mu.Lock().
 func (se *SearchEngine) indexTokenLocked(term string, id uint32, score int) {
-	docMap, exists := se.DataMap[term]
-	if !exists {
+	docMap, termExists := se.DataMap[term]
+	if !termExists {
 		se.termSet.Store(term, struct{}{})
 		if len(term) >= 4 {
 			se.Symspell.AddWord(term)
@@ -902,15 +900,15 @@ func (se *SearchEngine) SingleTermSearch(queryTokens []string, filters map[strin
 	se.mu.RLock()
 	prefixTokens := append([]string(nil), se.Prefix[queryTokens[0]]...)
 	var fuzzyWords []string
-	if len(prefixTokens) == 0 {
+	if len(prefixTokens) == 0 && !exactExists {
 		fuzzyWords = se.Symspell.FuzzySearch(queryTokens[0], maxFuzzyTokens)
 	}
 	se.mu.RUnlock()
-
-	if len(prefixTokens) < maxPrefixTokens {
-		maxPrefixTokens = len(prefixTokens)
+	if len(prefixTokens) > maxPrefixTokens {
+		prefixTokens = prefixTokens[:maxPrefixTokens]
 	}
-	guessArr := prefixTokens[:maxPrefixTokens]
+
+	guessArr := prefixTokens
 
 	if len(guessArr) > 0 {
 		parsedQuery["prefix"] = append(parsedQuery["prefix"], guessArr...)
@@ -961,17 +959,17 @@ func (se *SearchEngine) MultiTermSearch(queryTokens []string, filters map[string
 
 	_, lastExists := se.termSet.Load(rawLastTerm)
 	se.mu.RLock()
+	maxPrefix := 40
+	if len(se.Prefix[rawLastTerm]) < maxPrefix {
+		maxPrefix = len(se.Prefix[rawLastTerm])
+	}
+	lastTermGuessArr := append([]string(nil), se.Prefix[rawLastTerm][:maxPrefix]...)
 	for k, firstTerm := range rawFirstTerms {
 		if _, ok := se.termSet.Load(firstTerm); ok {
 			termArrList[k] = []string{firstTerm}
 		}
 		termArrList[k] = append(termArrList[k], se.Symspell.FuzzySearch(firstTerm, 10)...)
 	}
-	maxPrefix := 40
-	if len(se.Prefix[rawLastTerm]) < maxPrefix {
-		maxPrefix = len(se.Prefix[rawLastTerm])
-	}
-	lastTermGuessArr := append([]string(nil), se.Prefix[rawLastTerm][:maxPrefix]...)
 	se.mu.RUnlock()
 
 	if lastExists {
